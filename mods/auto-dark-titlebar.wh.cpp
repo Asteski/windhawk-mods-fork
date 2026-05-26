@@ -1,0 +1,341 @@
+// ==WindhawkMod==
+// @id              auto-dark-titlebar
+// @name            Auto Dark Titlebar
+// @description     Automatically enables/disables dark titlebars based on Windows theme mode
+// @version         1.0.1
+// @author          Asteski
+// @github          https://github.com/Asteski
+// @include         *
+// @compilerOptions -ldwmapi -luxtheme
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Auto Dark Titlebar
+
+This mod automatically switches titlebar dark mode based on your Windows system theme.
+When Windows is in dark mode, it enables dark titlebars for all eligible windows.
+When Windows switches to light mode, it disables dark titlebars.
+
+The mod listens for theme changes in real-time and updates all windows accordingly.
+
+## How it works
+- Monitors Windows theme mode changes (WM_DWMCOLORIZATIONCOLORCHANGED, WM_SETTINGCHANGE)
+- Automatically applies DWMWA_USE_IMMERSIVE_DARK_MODE attribute to windows
+- Works with all standard Win32 windows that have titlebars in injected processes
+*/
+// ==/WindhawkModReadme==
+
+#include <windows.h>
+#include <dwmapi.h>
+
+// DWMWA_USE_IMMERSIVE_DARK_MODE attribute
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+
+// Function pointer types
+typedef HRESULT(WINAPI* pShouldAppsUseDarkMode)();
+typedef HRESULT(WINAPI* pShouldSystemUseDarkMode)();
+
+// Global variables
+static pShouldSystemUseDarkMode g_ShouldSystemUseDarkMode = nullptr;
+static BOOL g_isDarkMode = FALSE;
+
+// Check if system is using dark mode
+BOOL IsSystemDarkMode() {
+    // Check registry first (most reliable)
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, 
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        
+        DWORD value = 0;
+        DWORD size = sizeof(DWORD);
+        // AppsUseLightTheme: 0 = dark mode, 1 = light mode
+        if (RegQueryValueExW(hKey, L"AppsUseLightTheme", nullptr, nullptr,
+            (LPBYTE)&value, &size) == ERROR_SUCCESS) {
+            RegCloseKey(hKey);
+            return value == 0;
+        }
+        RegCloseKey(hKey);
+    }
+    
+    // Fallback: Try uxtheme function
+    if (!g_ShouldSystemUseDarkMode) {
+        HMODULE hUxtheme = GetModuleHandleW(L"uxtheme.dll");
+        if (hUxtheme) {
+            // Ordinal 138 is ShouldSystemUseDarkMode
+            g_ShouldSystemUseDarkMode = (pShouldSystemUseDarkMode)GetProcAddress(
+                hUxtheme, MAKEINTRESOURCEA(138));
+        }
+    }
+    
+    if (g_ShouldSystemUseDarkMode) {
+        return g_ShouldSystemUseDarkMode() != 0;
+    }
+    
+    return FALSE;
+}
+
+// Check if current process should be excluded
+BOOL IsProcessExcluded() {
+    static int isExcluded = -1; // -1 = not checked, 0 = not excluded, 1 = excluded
+    
+    if (isExcluded != -1) {
+        return isExcluded == 1;
+    }
+    
+    WCHAR exePath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) {
+        isExcluded = 0;
+        return FALSE;
+    }
+    
+    // Get just the filename
+    WCHAR* fileName = wcsrchr(exePath, L'\\');
+    if (fileName) {
+        fileName++; // Skip the backslash
+    } else {
+        fileName = exePath;
+    }
+    
+    // Convert to lowercase for comparison
+    for (WCHAR* p = fileName; *p; p++) {
+        *p = towlower(*p);
+    }
+    
+    // List of excluded processes
+    const WCHAR* excludedProcesses[] = {
+        L"systemsettings.exe",
+        L"applicationframehost.exe", // UWP app host
+        nullptr
+    };
+    
+    for (int i = 0; excludedProcesses[i] != nullptr; i++) {
+        if (wcscmp(fileName, excludedProcesses[i]) == 0) {
+            Wh_Log(L"Process excluded: %s", fileName);
+            isExcluded = 1;
+            return TRUE;
+        }
+    }
+    
+    isExcluded = 0;
+    return FALSE;
+}
+
+// Check if window is eligible for dark mode
+BOOL IsWindowEligible(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd))
+        return FALSE;
+        
+    // Get window styles
+    LONG style = GetWindowLongW(hWnd, GWL_STYLE);
+    LONG styleEx = GetWindowLongW(hWnd, GWL_EXSTYLE);
+    
+    // Must have a titlebar (caption)
+    if (!(style & WS_CAPTION))
+        return FALSE;
+        
+    // Skip tool windows
+    if (styleEx & WS_EX_TOOLWINDOW)
+        return FALSE;
+        
+    // Skip child windows
+    if (style & WS_CHILD)
+        return FALSE;
+    
+    return TRUE;
+}
+
+// Apply dark mode to a window.
+// forceRedraw: pass TRUE for already-visible windows (theme change / mod init) to repaint the
+// titlebar immediately. Pass FALSE for windows being newly created — the DWM attribute is set
+// before the first paint so no forced redraw is needed, and calling SetWindowPos re-entrantly
+// from inside CreateWindowEx can break apps with complex initialization (e.g. Windows Terminal
+// using XAML Islands, Task View drag state, etc.).
+VOID ApplyDarkMode(HWND hWnd, BOOL useDarkMode, BOOL forceRedraw) {
+    if (!IsWindowEligible(hWnd))
+        return;
+        
+    BOOL value = useDarkMode ? TRUE : FALSE;
+    HRESULT hr = DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 
+        &value, sizeof(value));
+    
+    if (SUCCEEDED(hr)) {
+        // Only force a non-client repaint for existing windows, and only when no mouse
+        // drag is active (avoids corrupting Task View virtual-desktop drag state).
+        if (forceRedraw && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+            SetWindowPos(hWnd, nullptr, 0, 0, 0, 0, 
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        }
+        Wh_Log(L"Applied dark mode (%d) to window: %p", useDarkMode, hWnd);
+    }
+}
+
+// Apply dark mode to a specific window (called from hook)
+VOID NewWindowShown(HWND hWnd) {
+    if (IsProcessExcluded())
+        return;
+        
+    if (!hWnd || !IsWindow(hWnd))
+        return;
+        
+    if (!IsWindowEligible(hWnd))
+        return;
+    
+    Wh_Log(L"New window detected: %p, applying dark mode: %d", hWnd, g_isDarkMode);
+    ApplyDarkMode(hWnd, g_isDarkMode, FALSE); // newly created — no forced redraw needed
+}
+
+// Enumerate callback for existing windows
+BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) {
+    BOOL useDarkMode = (BOOL)lParam;
+    
+    // Skip if not a top-level window
+    HWND hParentWnd = GetAncestor(hWnd, GA_PARENT);
+    if (hParentWnd && hParentWnd != GetDesktopWindow())
+        return TRUE;
+    
+    // Check if window belongs to current process
+    DWORD dwProcessId = 0;
+    if (!GetWindowThreadProcessId(hWnd, &dwProcessId) || 
+        dwProcessId != GetCurrentProcessId())
+        return TRUE;
+    
+    ApplyDarkMode(hWnd, useDarkMode, TRUE); // existing window — force repaint
+    return TRUE;
+}
+
+// Apply dark mode to all existing windows in current process
+VOID ApplyToAllWindows(BOOL useDarkMode) {
+    EnumWindows(EnumWindowsProc, (LPARAM)useDarkMode);
+}
+
+// Hook DefWindowProc to catch theme changes
+using DefWindowProc_t = decltype(&DefWindowProcW);
+DefWindowProc_t DefWindowProc_orig;
+
+LRESULT WINAPI DefWindowProc_hook(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    // Detect theme change messages
+    if (!IsProcessExcluded() && (Msg == WM_DWMCOLORIZATIONCOLORCHANGED || Msg == WM_SETTINGCHANGE)) {
+        BOOL newDarkMode = IsSystemDarkMode();
+        
+        if (newDarkMode != g_isDarkMode) {
+            g_isDarkMode = newDarkMode;
+            Wh_Log(L"[Process %d] Theme changed to %s mode", 
+                GetCurrentProcessId(), newDarkMode ? L"DARK" : L"LIGHT");
+            
+            // Apply to all windows in current process
+            ApplyToAllWindows(g_isDarkMode);
+        }
+    }
+    
+    return DefWindowProc_orig(hWnd, Msg, wParam, lParam);
+}
+
+// Hook CreateWindowExW/A (documented APIs) instead of internal NtUserCreateWindowEx
+// Using the public user32 APIs avoids instability and potential crashes (e.g. explorer restarts)
+// that can happen when hooking low-level win32u internal functions.
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+static CreateWindowExW_t CreateWindowExW_orig;
+
+HWND WINAPI CreateWindowExW_hook(
+    DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName,
+    DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
+    HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam) {
+    HWND hWnd = CreateWindowExW_orig(
+        dwExStyle, lpClassName, lpWindowName, dwStyle,
+        X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+    if (hWnd) {
+        NewWindowShown(hWnd);
+    }
+    return hWnd;
+}
+
+using CreateWindowExA_t = decltype(&CreateWindowExA);
+static CreateWindowExA_t CreateWindowExA_orig;
+
+HWND WINAPI CreateWindowExA_hook(
+    DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName,
+    DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
+    HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam) {
+    HWND hWnd = CreateWindowExA_orig(
+        dwExStyle, lpClassName, lpWindowName, dwStyle,
+        X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+    if (hWnd) {
+        NewWindowShown(hWnd);
+    }
+    return hWnd;
+}
+
+// Windhawk mod initialization
+BOOL Wh_ModInit() {
+    Wh_Log(L"=======================================");
+    Wh_Log(L"[Process %d] Initializing Auto Dark Titlebar mod", GetCurrentProcessId());
+    
+    // Check if this process should be excluded
+    if (IsProcessExcluded()) {
+        Wh_Log(L"[Process %d] Process is excluded, skipping initialization", GetCurrentProcessId());
+        Wh_Log(L"=======================================");
+        return TRUE; // Return TRUE so mod doesn't fail, just does nothing
+    }
+    
+    // Get initial dark mode state
+    g_isDarkMode = IsSystemDarkMode();
+    Wh_Log(L"[Process %d] Initial theme mode: %s", 
+        GetCurrentProcessId(), g_isDarkMode ? L"DARK" : L"LIGHT");
+    
+    // Hook DefWindowProc to detect theme changes (works globally)
+    if (!Wh_SetFunctionHook((void*)DefWindowProcW, (void*)DefWindowProc_hook,
+        (void**)&DefWindowProc_orig)) {
+        Wh_Log(L"[Process %d] ERROR: Failed to hook DefWindowProcW", GetCurrentProcessId());
+    } else {
+        Wh_Log(L"[Process %d] Successfully hooked DefWindowProcW", GetCurrentProcessId());
+    }
+    
+    // Hook CreateWindowExW and CreateWindowExA instead of internal NtUserCreateWindowEx
+    if (!Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_hook,
+        (void**)&CreateWindowExW_orig)) {
+        Wh_Log(L"[Process %d] ERROR: Failed to hook CreateWindowExW", GetCurrentProcessId());
+    } else {
+        Wh_Log(L"[Process %d] Successfully hooked CreateWindowExW", GetCurrentProcessId());
+    }
+    if (!Wh_SetFunctionHook((void*)CreateWindowExA, (void*)CreateWindowExA_hook,
+        (void**)&CreateWindowExA_orig)) {
+        Wh_Log(L"[Process %d] WARNING: Failed to hook CreateWindowExA (ANSI)", GetCurrentProcessId());
+    } else {
+        Wh_Log(L"[Process %d] Successfully hooked CreateWindowExA", GetCurrentProcessId());
+    }
+    
+    Wh_Log(L"[Process %d] Initialization complete", GetCurrentProcessId());
+    Wh_Log(L"=======================================");
+    
+    return TRUE;
+}
+
+// Apply to existing windows after initialization
+VOID Wh_ModAfterInit() {
+    if (IsProcessExcluded()) {
+        return;
+    }
+    
+    Wh_Log(L"[Process %d] Applying dark mode to existing windows...", GetCurrentProcessId());
+    ApplyToAllWindows(g_isDarkMode);
+    Wh_Log(L"[Process %d] Finished applying to existing windows", GetCurrentProcessId());
+}
+
+// Cleanup when mod is unloaded
+VOID Wh_ModUninit() {
+    if (IsProcessExcluded()) {
+        return;
+    }
+    
+    Wh_Log(L"[Process %d] Uninitializing Auto Dark Titlebar mod", GetCurrentProcessId());
+    
+    // Restore to default (remove dark mode attribute)
+    ApplyToAllWindows(FALSE);
+    
+    Wh_Log(L"[Process %d] Cleanup complete", GetCurrentProcessId());
+}
