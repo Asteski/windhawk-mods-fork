@@ -49,6 +49,7 @@ This mod allows you to toggle the visibility of hidden files in Windows Explorer
 #include <windows.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <stdio.h>
 
 // Settings structure
 struct {
