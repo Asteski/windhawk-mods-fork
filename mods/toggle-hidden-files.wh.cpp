@@ -59,6 +59,8 @@ struct {
 // Global variables
 HHOOK g_hKeyboardHook = nullptr;
 bool g_modEnabled = false;
+HANDLE g_hHookThread = nullptr;
+DWORD g_hookThreadId = 0;
 
 // Registry keys and values for hidden files settings
 const wchar_t* EXPLORER_ADVANCED_KEY = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
@@ -271,19 +273,43 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
 }
 
+// Low-level keyboard hooks only deliver callbacks to a thread that runs a
+// message loop. In the dedicated windhawk.exe tool process the main thread
+// exits after init, so the hook is installed on this dedicated thread which
+// owns the message pump for its lifetime.
+DWORD WINAPI HookThreadProc(LPVOID lpParameter) {
+    g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc,
+                                        GetModuleHandle(nullptr), 0);
+    if (!g_hKeyboardHook) {
+        return 1;
+    }
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UnhookWindowsHookEx(g_hKeyboardHook);
+    g_hKeyboardHook = nullptr;
+    return 0;
+}
+
 // Mod initialization
 BOOL WhTool_ModInit() {
     // Load settings
     LoadSettings();
-    
-    // Install keyboard hook
-    g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandle(nullptr), 0);
-    
-    if (!g_hKeyboardHook) {
+
+    g_modEnabled = true;
+
+    // Install the keyboard hook on a dedicated thread with a message loop.
+    g_hHookThread =
+        CreateThread(nullptr, 0, HookThreadProc, nullptr, 0, &g_hookThreadId);
+    if (!g_hHookThread) {
+        g_modEnabled = false;
         return FALSE;
     }
-    
-    g_modEnabled = true;
+
     return TRUE;
 }
 
@@ -296,10 +322,14 @@ void WhTool_ModSettingsChanged() {
 void WhTool_ModUninit() {
     g_modEnabled = false;
 
-    // Remove keyboard hook
-    if (g_hKeyboardHook) {
-        UnhookWindowsHookEx(g_hKeyboardHook);
-        g_hKeyboardHook = nullptr;
+    // Signal the hook thread to exit its message loop, then wait for it to
+    // unhook and finish.
+    if (g_hHookThread) {
+        PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_hHookThread, INFINITE);
+        CloseHandle(g_hHookThread);
+        g_hHookThread = nullptr;
+        g_hookThreadId = 0;
     }
 }
 
