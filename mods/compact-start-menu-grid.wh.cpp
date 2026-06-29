@@ -49,9 +49,6 @@ This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 ### Instructions:
 * Enable the mod in Windhawk.
 * **Restart StartMenuExperienceHost.exe**, sign out/in, or restart your computer to apply changes.
-
----
-**Author:** Asteski
 */
 // ==/WindhawkModReadme==
 
