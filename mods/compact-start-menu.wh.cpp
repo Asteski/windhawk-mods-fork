@@ -56,7 +56,7 @@
 # Compact Start Menu
 This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 
-| All apps without header (default) | Pinned section without header + Separator + All section in List view |
+| All apps without header (default) | Pinned without header + Separator + All apps in List view |
 | :---: | :---: |
 | ![Default](https://raw.githubusercontent.com/Asteski/Windhawk-Mods/refs/heads/main/img/compact-start-menu/1.png) | ![Pinned section and separator](https://raw.githubusercontent.com/Asteski/Windhawk-Mods/refs/heads/main/img/compact-start-menu/2.png) |
 
