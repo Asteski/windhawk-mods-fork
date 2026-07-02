@@ -58,7 +58,7 @@ This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 
 | All apps without header (default) | Pinned without header + Separator + All apps in List view |
 | :---: | :---: |
-| ![Default](https://raw.githubusercontent.com/Asteski/Windhawk-Mods/refs/heads/main/img/compact-start-menu/1.png) | ![Pinned section and separator](https://raw.githubusercontent.com/Asteski/Windhawk-Mods/refs/heads/main/img/compact-start-menu/2.png) |
+| ![Default](https://raw.githubusercontent.com/Asteski/windhawk-mods/main/img/compact-start-menu/1.png) | ![Pinned section and separator](https://raw.githubusercontent.com/Asteski/windhawk-mods/main/img/compact-start-menu/2.png) |
 
 ### Features:
 * **Shows "All apps":** Keeps the app list visible.
@@ -123,7 +123,7 @@ struct Settings {
     bool hideTopLevelHeader = true;
     std::wstring headerText = L"Installed apps";
     bool hideCategoryViewOption = true;
-    int hiddenHeaderIconGap = 16;
+    int hiddenHeaderIconGap = 0;
     ScrollBarMode scrollBarMode = ScrollBarMode::ShowWhileScrolling;
 };
 
