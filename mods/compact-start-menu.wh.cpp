@@ -50,7 +50,7 @@
 
 // ==WindhawkModReadme==
 /*
-# Compact Start Menu Grid
+# Compact Start Menu
 This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 
 ### Features:
@@ -110,7 +110,7 @@ struct Settings {
     std::wstring headerText = L"Installed apps";
     bool hideCategoryViewOption = true;
     int hiddenHeaderIconGap = 16;
-    ScrollBarMode scrollBarMode = ScrollBarMode::Show;
+    ScrollBarMode scrollBarMode = ScrollBarMode::ShowWhileScrolling;
 };
 
 Settings g_settings;
@@ -122,15 +122,77 @@ struct FlattenedSourceEntry {
     winrt::weak_ref<wuc::ItemsControl> itemsControl;
     wf::IInspectable originalSource{nullptr};
     wfc::IObservableVector<wf::IInspectable> flatSource{nullptr};
+    std::vector<wuc::GroupStyle> originalGroupStyles;
+};
+
+struct ElementState {
+    wux::Visibility visibility;
+    double width;
+    double minWidth;
+    double maxWidth;
+    double minHeight;
+    double height;
+    double maxHeight;
+    wux::Thickness margin;
+    wux::HorizontalAlignment horizontalAlignment;
+    wux::VerticalAlignment verticalAlignment;
+    double opacity;
+    bool isHitTestVisible;
+};
+
+struct CollapsedElementEntry {
+    winrt::weak_ref<wux::FrameworkElement> element;
+    ElementState originalState;
+    int64_t visibilityToken = 0;
+    int64_t widthToken = 0;
+    int64_t heightToken = 0;
+};
+
+struct SemanticZoomEntry {
+    winrt::weak_ref<wuc::SemanticZoom> semanticZoom;
+    bool originalCanChangeViews;
+    bool originalIsZoomOutButtonEnabled;
+    bool originalIsZoomedInViewActive;
+    int64_t canChangeViewsToken = 0;
+    int64_t isZoomOutButtonEnabledToken = 0;
+    int64_t isZoomedInViewActiveToken = 0;
+};
+
+struct ItemsWrapGridEntry {
+    winrt::weak_ref<wuc::ItemsWrapGrid> itemsWrapGrid;
+    wux::Thickness originalMargin;
+    wux::Thickness originalGroupPadding;
+    bool originalAreStickyGroupHeadersEnabled;
+    wucp::GroupHeaderPlacement originalGroupHeaderPlacement;
+    int64_t marginToken = 0;
+};
+
+struct HeaderTextEntry {
+    winrt::weak_ref<wuc::TextBlock> textBlock;
+    winrt::hstring originalText;
+    int64_t textToken = 0;
+};
+
+struct ScrollViewerEntry {
+    winrt::weak_ref<wuc::ScrollViewer> scrollViewer;
+    wuc::ScrollBarVisibility originalVerticalScrollBarVisibility;
+    winrt::event_token viewChangedToken{};
+    bool hasViewChangedToken = false;
+};
+
+struct ScrollBarEntry {
+    winrt::weak_ref<wucp::ScrollBar> scrollBar;
+    double originalOpacity;
+    bool originalIsHitTestVisible;
 };
 
 std::vector<FlattenedSourceEntry> g_flattenedSources;
-std::vector<winrt::weak_ref<wuc::SemanticZoom>> g_hookedSemanticZooms;
-std::vector<winrt::weak_ref<wuc::ItemsWrapGrid>> g_gapAdjustedItemsWrapGrids;
-std::vector<winrt::weak_ref<wux::FrameworkElement>> g_keepCollapsedElements;
-std::vector<winrt::weak_ref<wuc::TextBlock>> g_headerTextElements;
-std::vector<winrt::weak_ref<wuc::ScrollViewer>> g_scrollBarModeScrollViewers;
-std::vector<winrt::weak_ref<wucp::ScrollBar>> g_scrollBarModeScrollBars;
+std::vector<SemanticZoomEntry> g_hookedSemanticZooms;
+std::vector<ItemsWrapGridEntry> g_gapAdjustedItemsWrapGrids;
+std::vector<CollapsedElementEntry> g_keepCollapsedElements;
+std::vector<HeaderTextEntry> g_headerTextElements;
+std::vector<ScrollViewerEntry> g_scrollBarModeScrollViewers;
+std::vector<ScrollBarEntry> g_scrollBarModeScrollBars;
 wux::DispatcherTimer g_xamlTraversalTimer{nullptr};
 wux::DispatcherTimer g_scrollBarHideTimer{nullptr};
 wux::DispatcherTimer g_scrollBarFadeTimer{nullptr};
@@ -147,8 +209,7 @@ void LoadSettings() {
     g_settings.hideTopLevelHeader = Wh_GetIntSetting(L"hideTopLevelHeader") != 0;
 
     PCWSTR headerText = Wh_GetStringSetting(L"headerText");
-    g_settings.headerText =
-        headerText && *headerText ? headerText : L"Installed apps";
+    g_settings.headerText = *headerText ? headerText : L"Installed apps";
     Wh_FreeStringSetting(headerText);
 
     g_settings.hideCategoryViewOption =
@@ -159,40 +220,24 @@ void LoadSettings() {
     }
 
     PCWSTR scrollBarMode = Wh_GetStringSetting(L"scrollBarMode");
-    if (scrollBarMode && lstrcmpiW(scrollBarMode, L"hide") == 0) {
+    if (lstrcmpiW(scrollBarMode, L"hide") == 0) {
         g_settings.scrollBarMode = ScrollBarMode::Hide;
-    } else if (scrollBarMode &&
-               lstrcmpiW(scrollBarMode, L"showWhileScrolling") == 0) {
+    } else if (lstrcmpiW(scrollBarMode, L"showWhileScrolling") == 0) {
         g_settings.scrollBarMode = ScrollBarMode::ShowWhileScrolling;
-    } else if ((!scrollBarMode || !*scrollBarMode) &&
-               Wh_GetIntSetting(L"hideScrollBar") != 0) {
-        g_settings.scrollBarMode = ScrollBarMode::Hide;
     } else {
         g_settings.scrollBarMode = ScrollBarMode::Show;
     }
     Wh_FreeStringSetting(scrollBarMode);
 }
 
-HMODULE GetCurrentModuleHandle() {
-    HMODULE module;
-    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (PCWSTR)GetCurrentModuleHandle, &module)) {
-        return nullptr;
-    }
-
-    return module;
-}
-
-bool IsPinnedSectionElement(wux::FrameworkElement const& element, PCWSTR type) {
+bool IsPinnedSectionElement(wux::FrameworkElement const& element) {
     auto name = element.Name();
     auto className = winrt::get_class_name(element);
 
     return name == L"StartMenuPinnedList" ||
            name == L"PinnedList" ||
            name == L"PinnedListPipsPager" ||
-           className == L"StartMenu.PinnedList" ||
-           (type && lstrcmpiW(type, L"StartMenu.PinnedList") == 0);
+           className == L"StartMenu.PinnedList";
 }
 
 bool IsPinnedHeaderElement(wux::FrameworkElement const& element) {
@@ -222,15 +267,13 @@ bool IsAllAppsTopHeaderElement(wux::FrameworkElement const& element) {
            name == L"ViewSelectionButton";
 }
 
-bool IsGroupHeaderElement(wux::FrameworkElement const& element, PCWSTR type) {
+bool IsGroupHeaderElement(wux::FrameworkElement const& element) {
     auto className = winrt::get_class_name(element);
 
     return element.try_as<wuc::GridViewHeaderItem>() ||
            element.try_as<wuc::ListViewHeaderItem>() ||
            className == L"Windows.UI.Xaml.Controls.GridViewHeaderItem" ||
-           className == L"Windows.UI.Xaml.Controls.ListViewHeaderItem" ||
-           (type && (lstrcmpiW(type, L"Windows.UI.Xaml.Controls.GridViewHeaderItem") == 0 ||
-                     lstrcmpiW(type, L"Windows.UI.Xaml.Controls.ListViewHeaderItem") == 0));
+           className == L"Windows.UI.Xaml.Controls.ListViewHeaderItem";
 }
 
 void CollapseElement(wux::FrameworkElement const& element) {
@@ -272,16 +315,52 @@ void CollapseElement(wux::FrameworkElement const& element) {
     }
 }
 
+ElementState CaptureElementState(wux::FrameworkElement const& element) {
+    return {
+        element.Visibility(),
+        element.Width(),
+        element.MinWidth(),
+        element.MaxWidth(),
+        element.MinHeight(),
+        element.Height(),
+        element.MaxHeight(),
+        element.Margin(),
+        element.HorizontalAlignment(),
+        element.VerticalAlignment(),
+        element.Opacity(),
+        element.IsHitTestVisible(),
+    };
+}
+
+void RestoreElementState(wux::FrameworkElement const& element,
+                         ElementState const& state) {
+    element.Visibility(state.visibility);
+    element.Width(state.width);
+    element.MinWidth(state.minWidth);
+    element.MaxWidth(state.maxWidth);
+    element.MinHeight(state.minHeight);
+    element.Height(state.height);
+    element.MaxHeight(state.maxHeight);
+    element.Margin(state.margin);
+    element.HorizontalAlignment(state.horizontalAlignment);
+    element.VerticalAlignment(state.verticalAlignment);
+    element.Opacity(state.opacity);
+    element.IsHitTestVisible(state.isHitTestVisible);
+}
+
 void KeepElementCollapsed(wux::FrameworkElement const& element) {
     for (auto const& collapsedElement : g_keepCollapsedElements) {
-        if (collapsedElement.get() == element) {
+        if (collapsedElement.element.get() == element) {
             return;
         }
     }
 
-    g_keepCollapsedElements.push_back(winrt::make_weak(element));
+    CollapsedElementEntry entry{
+        winrt::make_weak(element),
+        CaptureElementState(element),
+    };
 
-    element.RegisterPropertyChangedCallback(
+    entry.visibilityToken = element.RegisterPropertyChangedCallback(
         wux::UIElement::VisibilityProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
             if (auto element = sender.try_as<wux::FrameworkElement>()) {
@@ -290,7 +369,7 @@ void KeepElementCollapsed(wux::FrameworkElement const& element) {
                 }
             }
         });
-    element.RegisterPropertyChangedCallback(
+    entry.widthToken = element.RegisterPropertyChangedCallback(
         wux::FrameworkElement::WidthProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
             if (auto element = sender.try_as<wux::FrameworkElement>()) {
@@ -299,7 +378,7 @@ void KeepElementCollapsed(wux::FrameworkElement const& element) {
                 }
             }
         });
-    element.RegisterPropertyChangedCallback(
+    entry.heightToken = element.RegisterPropertyChangedCallback(
         wux::FrameworkElement::HeightProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
             if (auto element = sender.try_as<wux::FrameworkElement>()) {
@@ -308,6 +387,13 @@ void KeepElementCollapsed(wux::FrameworkElement const& element) {
                 }
             }
         });
+
+    g_keepCollapsedElements.push_back(std::move(entry));
+}
+
+void CollapseAndKeepElement(wux::FrameworkElement const& element) {
+    KeepElementCollapsed(element);
+    CollapseElement(element);
 }
 
 bool IsCategoryText(winrt::hstring const& text) {
@@ -349,19 +435,25 @@ void ApplyHeaderText(wux::FrameworkElement const& element) {
     }
 
     if (auto textBlock = element.try_as<wuc::TextBlock>()) {
-        if (textBlock.Text() != g_settings.headerText) {
-            textBlock.Text(g_settings.headerText);
-        }
-
         for (auto const& headerTextElement : g_headerTextElements) {
-            if (headerTextElement.get() == textBlock) {
+            if (headerTextElement.textBlock.get() == textBlock) {
+                if (textBlock.Text() != g_settings.headerText) {
+                    textBlock.Text(g_settings.headerText);
+                }
                 return;
             }
         }
 
-        g_headerTextElements.push_back(winrt::make_weak(textBlock));
+        HeaderTextEntry entry{
+            winrt::make_weak(textBlock),
+            textBlock.Text(),
+        };
 
-        textBlock.RegisterPropertyChangedCallback(
+        if (textBlock.Text() != g_settings.headerText) {
+            textBlock.Text(g_settings.headerText);
+        }
+
+        entry.textToken = textBlock.RegisterPropertyChangedCallback(
             wuc::TextBlock::TextProperty(),
             [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
                 if (auto textBlock = sender.try_as<wuc::TextBlock>()) {
@@ -370,7 +462,46 @@ void ApplyHeaderText(wux::FrameworkElement const& element) {
                     }
                 }
             });
+
+        g_headerTextElements.push_back(std::move(entry));
     }
+}
+
+void ApplyHiddenHeaderIconGap(wuc::ItemsWrapGrid const& itemsWrapGrid);
+
+ItemsWrapGridEntry* FindItemsWrapGridEntry(
+    wuc::ItemsWrapGrid const& itemsWrapGrid) {
+    for (auto& adjustedItemsWrapGrid : g_gapAdjustedItemsWrapGrids) {
+        if (adjustedItemsWrapGrid.itemsWrapGrid.get() == itemsWrapGrid) {
+            return &adjustedItemsWrapGrid;
+        }
+    }
+
+    return nullptr;
+}
+
+void EnsureItemsWrapGridEntry(wuc::ItemsWrapGrid const& itemsWrapGrid) {
+    if (FindItemsWrapGridEntry(itemsWrapGrid)) {
+        return;
+    }
+
+    ItemsWrapGridEntry entry{
+        winrt::make_weak(itemsWrapGrid),
+        itemsWrapGrid.Margin(),
+        itemsWrapGrid.GroupPadding(),
+        itemsWrapGrid.AreStickyGroupHeadersEnabled(),
+        itemsWrapGrid.GroupHeaderPlacement(),
+    };
+
+    entry.marginToken = itemsWrapGrid.RegisterPropertyChangedCallback(
+        wux::FrameworkElement::MarginProperty(),
+        [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
+            if (auto itemsWrapGrid = sender.try_as<wuc::ItemsWrapGrid>()) {
+                ApplyHiddenHeaderIconGap(itemsWrapGrid);
+            }
+        });
+
+    g_gapAdjustedItemsWrapGrids.push_back(std::move(entry));
 }
 
 void ApplyHiddenHeaderIconGap(wuc::ItemsWrapGrid const& itemsWrapGrid) {
@@ -378,28 +509,14 @@ void ApplyHiddenHeaderIconGap(wuc::ItemsWrapGrid const& itemsWrapGrid) {
         return;
     }
 
+    EnsureItemsWrapGridEntry(itemsWrapGrid);
+
     auto margin = itemsWrapGrid.Margin();
     double topGap = static_cast<double>(g_settings.hiddenHeaderIconGap);
     if (margin.Top != topGap) {
         margin.Top = topGap;
         itemsWrapGrid.Margin(margin);
     }
-
-    for (auto const& adjustedItemsWrapGrid : g_gapAdjustedItemsWrapGrids) {
-        if (adjustedItemsWrapGrid.get() == itemsWrapGrid) {
-            return;
-        }
-    }
-
-    g_gapAdjustedItemsWrapGrids.push_back(winrt::make_weak(itemsWrapGrid));
-
-    itemsWrapGrid.RegisterPropertyChangedCallback(
-        wux::FrameworkElement::MarginProperty(),
-        [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
-            if (auto itemsWrapGrid = sender.try_as<wuc::ItemsWrapGrid>()) {
-                ApplyHiddenHeaderIconGap(itemsWrapGrid);
-            }
-        });
 }
 
 bool IsInAllAppsArea(wux::FrameworkElement const& element) {
@@ -422,16 +539,17 @@ void CompactAllAppsItemsWrapGrid(wuc::ItemsWrapGrid const& itemsWrapGrid) {
         return;
     }
 
+    EnsureItemsWrapGridEntry(itemsWrapGrid);
+
     itemsWrapGrid.GroupPadding({});
     itemsWrapGrid.AreStickyGroupHeadersEnabled(false);
     itemsWrapGrid.GroupHeaderPlacement(wucp::GroupHeaderPlacement::Top);
     ApplyHiddenHeaderIconGap(itemsWrapGrid);
 }
 
-bool IsAllAppsGridView(wux::FrameworkElement const& element, PCWSTR type) {
+bool IsAllAppsGridView(wux::FrameworkElement const& element) {
     return element.Name() == L"AllAppsGrid" ||
            element.Name() == L"AppsList" ||
-           (type && lstrcmpiW(type, L"StartDocked.AllAppsGridListView") == 0) ||
            winrt::get_class_name(element) == L"StartDocked.AllAppsGridListView";
 }
 
@@ -528,9 +646,8 @@ void RefreshFlattenedSource(FlattenedSourceEntry& entry) {
     }
 }
 
-void FlattenAllAppsGridSource(wux::FrameworkElement const& element,
-                              PCWSTR type) {
-    if (!IsAllAppsGridView(element, type)) {
+void FlattenAllAppsGridSource(wux::FrameworkElement const& element) {
+    if (!IsAllAppsGridView(element)) {
         return;
     }
 
@@ -552,20 +669,29 @@ void FlattenAllAppsGridSource(wux::FrameworkElement const& element,
         return;
     }
 
-    auto flatSource = winrt::single_threaded_observable_vector(std::move(flatItems));
-    itemsControl.ItemsSource(flatSource);
-    if (itemsControl.GroupStyle().Size() > 0) {
-        itemsControl.GroupStyle().Clear();
+    std::vector<wuc::GroupStyle> originalGroupStyles;
+    auto groupStyles = itemsControl.GroupStyle();
+    originalGroupStyles.reserve(groupStyles.Size());
+    for (uint32_t i = 0; i < groupStyles.Size(); i++) {
+        originalGroupStyles.push_back(groupStyles.GetAt(i));
     }
 
-    g_flattenedSources.push_back(
-        {winrt::make_weak(itemsControl), originalSource, flatSource});
+    auto flatSource = winrt::single_threaded_observable_vector(std::move(flatItems));
+    itemsControl.ItemsSource(flatSource);
+    if (groupStyles.Size() > 0) {
+        groupStyles.Clear();
+    }
+
+    g_flattenedSources.push_back({winrt::make_weak(itemsControl),
+                                  originalSource,
+                                  flatSource,
+                                  std::move(originalGroupStyles)});
 }
 
 void FlattenAllAppsGridSourceFromAncestor(wux::FrameworkElement const& element) {
     auto current = element;
     while (current) {
-        FlattenAllAppsGridSource(current, nullptr);
+        FlattenAllAppsGridSource(current);
         current = wux::Media::VisualTreeHelper::GetParent(current)
                       .try_as<wux::FrameworkElement>();
     }
@@ -577,12 +703,17 @@ void DisableCategorySemanticZoom(wuc::SemanticZoom const& semanticZoom) {
     }
 
     for (auto const& hookedSemanticZoom : g_hookedSemanticZooms) {
-        if (hookedSemanticZoom.get() == semanticZoom) {
+        if (hookedSemanticZoom.semanticZoom.get() == semanticZoom) {
             return;
         }
     }
 
-    g_hookedSemanticZooms.push_back(winrt::make_weak(semanticZoom));
+    SemanticZoomEntry entry{
+        winrt::make_weak(semanticZoom),
+        semanticZoom.CanChangeViews(),
+        semanticZoom.IsZoomOutButtonEnabled(),
+        semanticZoom.IsZoomedInViewActive(),
+    };
 
     semanticZoom.CanChangeViews(false);
     semanticZoom.IsZoomOutButtonEnabled(false);
@@ -590,7 +721,7 @@ void DisableCategorySemanticZoom(wuc::SemanticZoom const& semanticZoom) {
         semanticZoom.IsZoomedInViewActive(true);
     }
 
-    semanticZoom.RegisterPropertyChangedCallback(
+    entry.canChangeViewsToken = semanticZoom.RegisterPropertyChangedCallback(
         wuc::SemanticZoom::CanChangeViewsProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
             if (auto semanticZoom = sender.try_as<wuc::SemanticZoom>()) {
@@ -600,7 +731,7 @@ void DisableCategorySemanticZoom(wuc::SemanticZoom const& semanticZoom) {
             }
         });
 
-    semanticZoom.RegisterPropertyChangedCallback(
+    entry.isZoomOutButtonEnabledToken = semanticZoom.RegisterPropertyChangedCallback(
         wuc::SemanticZoom::IsZoomOutButtonEnabledProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
             if (auto semanticZoom = sender.try_as<wuc::SemanticZoom>()) {
@@ -610,7 +741,7 @@ void DisableCategorySemanticZoom(wuc::SemanticZoom const& semanticZoom) {
             }
         });
 
-    semanticZoom.RegisterPropertyChangedCallback(
+    entry.isZoomedInViewActiveToken = semanticZoom.RegisterPropertyChangedCallback(
         wuc::SemanticZoom::IsZoomedInViewActiveProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
             if (auto semanticZoom = sender.try_as<wuc::SemanticZoom>()) {
@@ -619,6 +750,8 @@ void DisableCategorySemanticZoom(wuc::SemanticZoom const& semanticZoom) {
                 }
             }
         });
+
+    g_hookedSemanticZooms.push_back(std::move(entry));
 }
 
 void SetScrollViewerVerticalScrollBarVisibility(
@@ -652,8 +785,8 @@ void FadeAutoScrollBars() {
     }
 
     bool stillFading = false;
-    for (auto const& weakScrollBar : g_scrollBarModeScrollBars) {
-        if (auto scrollBar = weakScrollBar.get()) {
+    for (auto const& entry : g_scrollBarModeScrollBars) {
+        if (auto scrollBar = entry.scrollBar.get()) {
             double opacity = scrollBar.Opacity();
             double nextOpacity = opacity > 0.2 ? opacity - 0.2 : 0;
             SetScrollBarOpacity(scrollBar, nextOpacity);
@@ -708,8 +841,8 @@ void ShowAutoScrollBarsWhileScrolling(wuc::ScrollViewer const& scrollViewer) {
     SetScrollViewerVerticalScrollBarVisibility(
         scrollViewer, wuc::ScrollBarVisibility::Visible);
 
-    for (auto const& weakScrollBar : g_scrollBarModeScrollBars) {
-        if (auto scrollBar = weakScrollBar.get()) {
+    for (auto const& entry : g_scrollBarModeScrollBars) {
+        if (auto scrollBar = entry.scrollBar.get()) {
             SetScrollBarOpacity(scrollBar, 1);
         }
     }
@@ -717,10 +850,28 @@ void ShowAutoScrollBarsWhileScrolling(wuc::ScrollViewer const& scrollViewer) {
     RestartScrollBarHideTimer();
 }
 
+ScrollBarEntry* EnsureScrollBarEntry(wucp::ScrollBar const& scrollBar) {
+    for (auto& entry : g_scrollBarModeScrollBars) {
+        if (entry.scrollBar.get() == scrollBar) {
+            return &entry;
+        }
+    }
+
+    g_scrollBarModeScrollBars.push_back({
+        winrt::make_weak(scrollBar),
+        scrollBar.Opacity(),
+        scrollBar.IsHitTestVisible(),
+    });
+
+    return &g_scrollBarModeScrollBars.back();
+}
+
 void ApplyScrollBarElementMode(wucp::ScrollBar const& scrollBar) {
     if (!IsInAllAppsArea(scrollBar)) {
         return;
     }
+
+    EnsureScrollBarEntry(scrollBar);
 
     if (g_settings.scrollBarMode == ScrollBarMode::Show) {
         SetScrollBarOpacity(scrollBar, 1);
@@ -732,20 +883,57 @@ void ApplyScrollBarElementMode(wucp::ScrollBar const& scrollBar) {
         return;
     }
 
-    for (auto const& weakScrollBar : g_scrollBarModeScrollBars) {
-        if (weakScrollBar.get() == scrollBar) {
-            return;
+    SetScrollBarOpacity(scrollBar, 0);
+}
+
+ScrollViewerEntry* EnsureScrollViewerEntry(
+    wuc::ScrollViewer const& scrollViewer,
+    bool registerViewChanged) {
+    for (auto& entry : g_scrollBarModeScrollViewers) {
+        if (entry.scrollViewer.get() == scrollViewer) {
+            if (registerViewChanged && !entry.hasViewChangedToken) {
+                entry.viewChangedToken = scrollViewer.ViewChanged(
+                    [](wf::IInspectable const& sender,
+                       wuc::ScrollViewerViewChangedEventArgs const&) {
+                        if (auto scrollViewer = sender.try_as<wuc::ScrollViewer>()) {
+                            ShowAutoScrollBarsWhileScrolling(scrollViewer);
+                        }
+                    });
+                entry.hasViewChangedToken = true;
+            }
+
+            return &entry;
         }
     }
 
-    g_scrollBarModeScrollBars.push_back(winrt::make_weak(scrollBar));
-    SetScrollBarOpacity(scrollBar, 0);
+    ScrollViewerEntry entry{
+        winrt::make_weak(scrollViewer),
+        scrollViewer.VerticalScrollBarVisibility(),
+    };
+
+    if (registerViewChanged) {
+        entry.viewChangedToken = scrollViewer.ViewChanged(
+            [](wf::IInspectable const& sender,
+               wuc::ScrollViewerViewChangedEventArgs const&) {
+                if (auto scrollViewer = sender.try_as<wuc::ScrollViewer>()) {
+                    ShowAutoScrollBarsWhileScrolling(scrollViewer);
+                }
+            });
+        entry.hasViewChangedToken = true;
+    }
+
+    g_scrollBarModeScrollViewers.push_back(std::move(entry));
+    return &g_scrollBarModeScrollViewers.back();
 }
 
 void ApplyScrollBarMode(wuc::ScrollViewer const& scrollViewer) {
     if (!IsInAllAppsArea(scrollViewer)) {
         return;
     }
+
+    EnsureScrollViewerEntry(
+        scrollViewer,
+        g_settings.scrollBarMode == ScrollBarMode::ShowWhileScrolling);
 
     if (g_settings.scrollBarMode == ScrollBarMode::Show) {
         SetScrollViewerVerticalScrollBarVisibility(
@@ -759,31 +947,14 @@ void ApplyScrollBarMode(wuc::ScrollViewer const& scrollViewer) {
         return;
     }
 
-    for (auto const& weakScrollViewer : g_scrollBarModeScrollViewers) {
-        if (weakScrollViewer.get() == scrollViewer) {
-            return;
-        }
-    }
-
-    g_scrollBarModeScrollViewers.push_back(winrt::make_weak(scrollViewer));
-
     SetScrollViewerVerticalScrollBarVisibility(
         scrollViewer, wuc::ScrollBarVisibility::Visible);
-
-    scrollViewer.ViewChanged(
-        [](wf::IInspectable const& sender,
-           wuc::ScrollViewerViewChangedEventArgs const&) {
-            if (auto scrollViewer = sender.try_as<wuc::ScrollViewer>()) {
-                ShowAutoScrollBarsWhileScrolling(scrollViewer);
-            }
-        });
 }
 
-void HideStartMenuElement(wux::FrameworkElement const& element,
-                          PCWSTR type) {
+void HideStartMenuElement(wux::FrameworkElement const& element) {
     ApplyHeaderText(element);
 
-    FlattenAllAppsGridSource(element, type);
+    FlattenAllAppsGridSource(element);
 
     if (auto semanticZoom = element.try_as<wuc::SemanticZoom>()) {
         DisableCategorySemanticZoom(semanticZoom);
@@ -791,8 +962,7 @@ void HideStartMenuElement(wux::FrameworkElement const& element,
 
     if (g_settings.hideCategoryViewOption) {
         if (auto categoryViewOption = FindCategoryViewOptionTarget(element)) {
-            CollapseElement(categoryViewOption);
-            KeepElementCollapsed(categoryViewOption);
+            CollapseAndKeepElement(categoryViewOption);
             return;
         }
     }
@@ -805,9 +975,9 @@ void HideStartMenuElement(wux::FrameworkElement const& element,
         ApplyScrollBarElementMode(scrollBar);
     }
 
-    if (IsGroupHeaderElement(element, type) ||
+    if (IsGroupHeaderElement(element) ||
         (g_settings.hidePinnedSection &&
-         IsPinnedSectionElement(element, type)) ||
+         IsPinnedSectionElement(element)) ||
         ((g_settings.hidePinnedSection || g_settings.hidePinnedHeader) &&
          IsPinnedHeaderElement(element)) ||
         (g_settings.hideRecommendedSection &&
@@ -816,14 +986,13 @@ void HideStartMenuElement(wux::FrameworkElement const& element,
           g_settings.hideRecommendedHeader) &&
          IsRecommendedHeaderElement(element)) ||
         (g_settings.hideTopLevelHeader && IsAllAppsTopHeaderElement(element))) {
-        CollapseElement(element);
-        KeepElementCollapsed(element);
+        CollapseAndKeepElement(element);
     }
 
     if (auto itemsWrapGrid = element.try_as<wuc::ItemsWrapGrid>()) {
         CompactAllAppsItemsWrapGrid(itemsWrapGrid);
         FlattenAllAppsGridSourceFromAncestor(element);
-    } else if (IsGroupHeaderElement(element, type)) {
+    } else if (IsGroupHeaderElement(element)) {
         FlattenAllAppsGridSourceFromAncestor(element);
     }
 }
@@ -836,7 +1005,7 @@ void ProcessXamlElement(wux::FrameworkElement const& element) {
     g_processingXamlElement = true;
 
     try {
-        HideStartMenuElement(element, nullptr);
+        HideStartMenuElement(element);
     } catch (...) {
         Wh_Log(L"ProcessXamlElement error: %08X", winrt::to_hresult());
     }
@@ -919,20 +1088,189 @@ void InstallXamlTraversal() {
     }
 }
 
+void StopXamlTimers() {
+    if (g_xamlTraversalTimer) {
+        g_xamlTraversalTimer.Stop();
+        g_xamlTraversalTimer = nullptr;
+    }
+    if (g_scrollBarHideTimer) {
+        g_scrollBarHideTimer.Stop();
+        g_scrollBarHideTimer = nullptr;
+    }
+    if (g_scrollBarFadeTimer) {
+        g_scrollBarFadeTimer.Stop();
+        g_scrollBarFadeTimer = nullptr;
+    }
+}
+
+void RestoreFlattenedSources() {
+    for (auto& entry : g_flattenedSources) {
+        try {
+            auto itemsControl = entry.itemsControl.get();
+            if (!itemsControl) {
+                continue;
+            }
+
+            if (entry.originalSource) {
+                itemsControl.ItemsSource(entry.originalSource);
+            }
+
+            auto groupStyles = itemsControl.GroupStyle();
+            groupStyles.Clear();
+            for (auto const& groupStyle : entry.originalGroupStyles) {
+                groupStyles.Append(groupStyle);
+            }
+        } catch (...) {
+            Wh_Log(L"RestoreFlattenedSources error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RestoreCollapsedElements() {
+    for (auto& entry : g_keepCollapsedElements) {
+        try {
+            auto element = entry.element.get();
+            if (!element) {
+                continue;
+            }
+
+            element.UnregisterPropertyChangedCallback(
+                wux::UIElement::VisibilityProperty(), entry.visibilityToken);
+            element.UnregisterPropertyChangedCallback(
+                wux::FrameworkElement::WidthProperty(), entry.widthToken);
+            element.UnregisterPropertyChangedCallback(
+                wux::FrameworkElement::HeightProperty(), entry.heightToken);
+
+            RestoreElementState(element, entry.originalState);
+        } catch (...) {
+            Wh_Log(L"RestoreCollapsedElements error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RestoreHeaderTextElements() {
+    for (auto& entry : g_headerTextElements) {
+        try {
+            auto textBlock = entry.textBlock.get();
+            if (!textBlock) {
+                continue;
+            }
+
+            textBlock.UnregisterPropertyChangedCallback(
+                wuc::TextBlock::TextProperty(), entry.textToken);
+            textBlock.Text(entry.originalText);
+        } catch (...) {
+            Wh_Log(L"RestoreHeaderTextElements error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RestoreItemsWrapGrids() {
+    for (auto& entry : g_gapAdjustedItemsWrapGrids) {
+        try {
+            auto itemsWrapGrid = entry.itemsWrapGrid.get();
+            if (!itemsWrapGrid) {
+                continue;
+            }
+
+            itemsWrapGrid.UnregisterPropertyChangedCallback(
+                wux::FrameworkElement::MarginProperty(), entry.marginToken);
+            itemsWrapGrid.Margin(entry.originalMargin);
+            itemsWrapGrid.GroupPadding(entry.originalGroupPadding);
+            itemsWrapGrid.AreStickyGroupHeadersEnabled(
+                entry.originalAreStickyGroupHeadersEnabled);
+            itemsWrapGrid.GroupHeaderPlacement(entry.originalGroupHeaderPlacement);
+        } catch (...) {
+            Wh_Log(L"RestoreItemsWrapGrids error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RestoreSemanticZooms() {
+    for (auto& entry : g_hookedSemanticZooms) {
+        try {
+            auto semanticZoom = entry.semanticZoom.get();
+            if (!semanticZoom) {
+                continue;
+            }
+
+            semanticZoom.UnregisterPropertyChangedCallback(
+                wuc::SemanticZoom::CanChangeViewsProperty(),
+                entry.canChangeViewsToken);
+            semanticZoom.UnregisterPropertyChangedCallback(
+                wuc::SemanticZoom::IsZoomOutButtonEnabledProperty(),
+                entry.isZoomOutButtonEnabledToken);
+            semanticZoom.UnregisterPropertyChangedCallback(
+                wuc::SemanticZoom::IsZoomedInViewActiveProperty(),
+                entry.isZoomedInViewActiveToken);
+
+            semanticZoom.CanChangeViews(entry.originalCanChangeViews);
+            semanticZoom.IsZoomOutButtonEnabled(
+                entry.originalIsZoomOutButtonEnabled);
+            semanticZoom.IsZoomedInViewActive(entry.originalIsZoomedInViewActive);
+        } catch (...) {
+            Wh_Log(L"RestoreSemanticZooms error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RestoreScrollViewerModes() {
+    for (auto& entry : g_scrollBarModeScrollViewers) {
+        try {
+            auto scrollViewer = entry.scrollViewer.get();
+            if (!scrollViewer) {
+                continue;
+            }
+
+            if (entry.hasViewChangedToken) {
+                scrollViewer.ViewChanged(entry.viewChangedToken);
+            }
+
+            scrollViewer.VerticalScrollBarVisibility(
+                entry.originalVerticalScrollBarVisibility);
+        } catch (...) {
+            Wh_Log(L"RestoreScrollViewerModes error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RestoreScrollBarModes() {
+    for (auto& entry : g_scrollBarModeScrollBars) {
+        try {
+            auto scrollBar = entry.scrollBar.get();
+            if (!scrollBar) {
+                continue;
+            }
+
+            scrollBar.Opacity(entry.originalOpacity);
+            scrollBar.IsHitTestVisible(entry.originalIsHitTestVisible);
+        } catch (...) {
+            Wh_Log(L"RestoreScrollBarModes error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void ClearXamlState() {
+    g_flattenedSources.clear();
+    g_hookedSemanticZooms.clear();
+    g_gapAdjustedItemsWrapGrids.clear();
+    g_keepCollapsedElements.clear();
+    g_headerTextElements.clear();
+    g_scrollBarModeScrollViewers.clear();
+    g_scrollBarModeScrollBars.clear();
+}
+
 void UninstallXamlTraversal() {
     try {
-        if (g_xamlTraversalTimer) {
-            g_xamlTraversalTimer.Stop();
-            g_xamlTraversalTimer = nullptr;
-        }
-        if (g_scrollBarHideTimer) {
-            g_scrollBarHideTimer.Stop();
-            g_scrollBarHideTimer = nullptr;
-        }
-        if (g_scrollBarFadeTimer) {
-            g_scrollBarFadeTimer.Stop();
-            g_scrollBarFadeTimer = nullptr;
-        }
+        StopXamlTimers();
+        RestoreScrollViewerModes();
+        RestoreScrollBarModes();
+        RestoreSemanticZooms();
+        RestoreItemsWrapGrids();
+        RestoreHeaderTextElements();
+        RestoreCollapsedElements();
+        RestoreFlattenedSources();
+        ClearXamlState();
     } catch (...) {
         Wh_Log(L"UninstallXamlTraversal error: %08X", winrt::to_hresult());
     }
@@ -1142,13 +1480,6 @@ void Wh_ModUninit() {
         UninstallXamlTraversal();
     }
 
-    g_flattenedSources.clear();
-    g_hookedSemanticZooms.clear();
-    g_gapAdjustedItemsWrapGrids.clear();
-    g_keepCollapsedElements.clear();
-    g_headerTextElements.clear();
-    g_scrollBarModeScrollViewers.clear();
-    g_scrollBarModeScrollBars.clear();
     g_xamlTraversalInstalled = false;
 }
 
