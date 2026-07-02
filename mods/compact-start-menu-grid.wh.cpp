@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              compact-start-menu-grid
-// @name            Compact Start Menu Grid
+// @id              compact-start-menu
+// @name            Compact Start Menu
 // @description     Cleans up the Windows 11 Start menu by showing only a compact, ungrouped All apps view.
 // @version         1.0.0
 // @author          Asteski
@@ -18,15 +18,33 @@
 - hideCategoryViewOption: true
   $name: Hide category view option
   $description: Hide the Category option from the All apps view selector.
-- headerText: "All"
-  $name: Change header text
+- headerText: "Installed apps"
+  $name: Change Header Text
   $description: Text to show in the All apps header.
 - hiddenHeaderIconGap: 16
   $name: Hidden header icon gap
   $description: Top gap, in pixels, between search and the first icon row when the top header is hidden.
-- hideScrollBar: false
-  $name: Hide scroll bar
-  $description: Hide the All apps visual scroll bar.
+- scrollBarMode: "showWhileScrolling"
+  $name: Scroll bar
+  $description: Controls All apps scroll bar visibility.
+  $options:
+  - show: Show
+  - hide: Hide
+  - showWhileScrolling: Show while scrolling
+- SectionsAndHeaders:
+    - hidePinnedSection: true
+      $name: Hide pinned section
+      $description: Hide the Start menu pinned apps section.
+    - hidePinnedHeader: true
+      $name: Hide pinned header
+      $description: Hide the Pinned section header.
+    - hideRecommendedSection: true
+      $name: Hide recommended section
+      $description: Hide the Start menu recommended section.
+    - hideRecommendedHeader: true
+      $name: Hide recommended header
+      $description: Hide the Recommended section header.
+  $name: Other Sections
 */
 // ==/WindhawkModSettings==
 
@@ -37,14 +55,15 @@ This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 
 ### Features:
 * **Shows "All apps":** Keeps the app list visible.
-* **Hides "Pinned":** Removes the section with pinned apps.
-* **Hides "Recommended":** Removes the section with recent files.
+* **Optional pinned section hiding:** Can hide or show the section with pinned apps.
+* **Optional recommended section hiding:** Can hide or show the section with recent files.
+* **Optional section headers:** Can hide pinned and recommended headers independently.
 * **Hides group headers:** Removes the visible All apps group headers in grid and list views.
 * **Compacts grid view:** Reduces group-header spacing in the All apps grid.
 * **Optional top header:** Can hide the All apps title/view row.
 * **Optional category view hiding:** Can hide the Category option from the view selector.
 * **Hidden header icon gap:** Can adjust the first icon row spacing when the top header is hidden.
-* **Optional scroll bar hiding:** Can hide the visual All apps scroll bar.
+* **Scrollbar modes:** Can show, hide, or reveal the visual All apps scroll bar only while scrolling.
 
 ### Instructions:
 * Enable the mod in Windhawk.
@@ -53,16 +72,10 @@ This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 // ==/WindhawkModReadme==
 
 #include <windhawk_utils.h>
-
-#include <xamlom.h>
-
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <vector>
-
-#include <Unknwn.h>
-#include <combaseapi.h>
-#include <ocidl.h>
 
 #undef GetCurrentTime
 
@@ -82,17 +95,28 @@ namespace wuc = winrt::Windows::UI::Xaml::Controls;
 namespace wucp = winrt::Windows::UI::Xaml::Controls::Primitives;
 namespace wuxd = winrt::Windows::UI::Xaml::Data;
 
+enum class ScrollBarMode {
+    Show,
+    Hide,
+    ShowWhileScrolling,
+};
+
 struct Settings {
+    bool hidePinnedSection = true;
+    bool hidePinnedHeader = true;
+    bool hideRecommendedSection = true;
+    bool hideRecommendedHeader = true;
     bool hideTopLevelHeader = true;
-    std::wstring headerText = L"All";
+    std::wstring headerText = L"Installed apps";
     bool hideCategoryViewOption = true;
     int hiddenHeaderIconGap = 16;
-    bool hideScrollBar = false;
+    ScrollBarMode scrollBarMode = ScrollBarMode::Show;
 };
 
 Settings g_settings;
 
-std::atomic<DWORD> g_targetThreadId = 0;
+std::atomic<bool> g_xamlTraversalInstalled = false;
+thread_local bool g_processingXamlElement = false;
 
 struct FlattenedSourceEntry {
     winrt::weak_ref<wuc::ItemsControl> itemsControl;
@@ -103,12 +127,28 @@ struct FlattenedSourceEntry {
 std::vector<FlattenedSourceEntry> g_flattenedSources;
 std::vector<winrt::weak_ref<wuc::SemanticZoom>> g_hookedSemanticZooms;
 std::vector<winrt::weak_ref<wuc::ItemsWrapGrid>> g_gapAdjustedItemsWrapGrids;
+std::vector<winrt::weak_ref<wux::FrameworkElement>> g_keepCollapsedElements;
+std::vector<winrt::weak_ref<wuc::TextBlock>> g_headerTextElements;
+std::vector<winrt::weak_ref<wuc::ScrollViewer>> g_scrollBarModeScrollViewers;
+std::vector<winrt::weak_ref<wucp::ScrollBar>> g_scrollBarModeScrollBars;
+wux::DispatcherTimer g_xamlTraversalTimer{nullptr};
+wux::DispatcherTimer g_scrollBarHideTimer{nullptr};
+wux::DispatcherTimer g_scrollBarFadeTimer{nullptr};
 
 void LoadSettings() {
+    g_settings.hidePinnedSection =
+        Wh_GetIntSetting(L"SectionsAndHeaders.hidePinnedSection") != 0;
+    g_settings.hidePinnedHeader =
+        Wh_GetIntSetting(L"SectionsAndHeaders.hidePinnedHeader") != 0;
+    g_settings.hideRecommendedSection =
+        Wh_GetIntSetting(L"SectionsAndHeaders.hideRecommendedSection") != 0;
+    g_settings.hideRecommendedHeader =
+        Wh_GetIntSetting(L"SectionsAndHeaders.hideRecommendedHeader") != 0;
     g_settings.hideTopLevelHeader = Wh_GetIntSetting(L"hideTopLevelHeader") != 0;
 
     PCWSTR headerText = Wh_GetStringSetting(L"headerText");
-    g_settings.headerText = headerText && *headerText ? headerText : L"All";
+    g_settings.headerText =
+        headerText && *headerText ? headerText : L"Installed apps";
     Wh_FreeStringSetting(headerText);
 
     g_settings.hideCategoryViewOption =
@@ -117,7 +157,20 @@ void LoadSettings() {
     if (g_settings.hiddenHeaderIconGap < 0) {
         g_settings.hiddenHeaderIconGap = 0;
     }
-    g_settings.hideScrollBar = Wh_GetIntSetting(L"hideScrollBar") != 0;
+
+    PCWSTR scrollBarMode = Wh_GetStringSetting(L"scrollBarMode");
+    if (scrollBarMode && lstrcmpiW(scrollBarMode, L"hide") == 0) {
+        g_settings.scrollBarMode = ScrollBarMode::Hide;
+    } else if (scrollBarMode &&
+               lstrcmpiW(scrollBarMode, L"showWhileScrolling") == 0) {
+        g_settings.scrollBarMode = ScrollBarMode::ShowWhileScrolling;
+    } else if ((!scrollBarMode || !*scrollBarMode) &&
+               Wh_GetIntSetting(L"hideScrollBar") != 0) {
+        g_settings.scrollBarMode = ScrollBarMode::Hide;
+    } else {
+        g_settings.scrollBarMode = ScrollBarMode::Show;
+    }
+    Wh_FreeStringSetting(scrollBarMode);
 }
 
 HMODULE GetCurrentModuleHandle() {
@@ -133,41 +186,101 @@ HMODULE GetCurrentModuleHandle() {
 
 bool IsPinnedSectionElement(wux::FrameworkElement const& element, PCWSTR type) {
     auto name = element.Name();
+    auto className = winrt::get_class_name(element);
 
+    return name == L"StartMenuPinnedList" ||
+           name == L"PinnedList" ||
+           name == L"PinnedListPipsPager" ||
+           className == L"StartMenu.PinnedList" ||
+           (type && lstrcmpiW(type, L"StartMenu.PinnedList") == 0);
+}
+
+bool IsPinnedHeaderElement(wux::FrameworkElement const& element) {
+    auto name = element.Name();
     return name == L"PinnedListHeaderGrid" ||
            name == L"PinnedListHeaderText" ||
            name == L"ShowMorePinnedGrid" ||
            name == L"ShowMorePinnedButton" ||
-           name == L"ShowMorePinnedButtonText" ||
-           name == L"StartMenuPinnedList" ||
-           name == L"PinnedList" ||
-           name == L"PinnedListPipsPager" ||
-           (type && lstrcmpiW(type, L"StartMenu.PinnedList") == 0);
+           name == L"ShowMorePinnedButtonText";
+}
+
+bool IsRecommendedHeaderElement(wux::FrameworkElement const& element) {
+    auto name = element.Name();
+    return name == L"TopLevelSuggestionsListHeader" ||
+           name == L"TopLevelSuggestionsListHeaderText" ||
+           name == L"MoreSuggestionsListHeaderText" ||
+           name == L"ShowMoreSuggestions" ||
+           name == L"ShowMoreSuggestionsButton" ||
+           name == L"HideMoreSuggestionsButton";
+}
+
+bool IsAllAppsTopHeaderElement(wux::FrameworkElement const& element) {
+    auto name = element.Name();
+    return name == L"AllAppsPaneHeader" ||
+           name == L"AllListHeading" ||
+           name == L"AllListHeadingText" ||
+           name == L"ViewSelectionButton";
 }
 
 bool IsGroupHeaderElement(wux::FrameworkElement const& element, PCWSTR type) {
+    auto className = winrt::get_class_name(element);
+
     return element.try_as<wuc::GridViewHeaderItem>() ||
            element.try_as<wuc::ListViewHeaderItem>() ||
+           className == L"Windows.UI.Xaml.Controls.GridViewHeaderItem" ||
+           className == L"Windows.UI.Xaml.Controls.ListViewHeaderItem" ||
            (type && (lstrcmpiW(type, L"Windows.UI.Xaml.Controls.GridViewHeaderItem") == 0 ||
                      lstrcmpiW(type, L"Windows.UI.Xaml.Controls.ListViewHeaderItem") == 0));
 }
 
 void CollapseElement(wux::FrameworkElement const& element) {
-    element.Visibility(wux::Visibility::Collapsed);
-    element.Width(0);
-    element.MinWidth(0);
-    element.MaxWidth(0);
-    element.MinHeight(0);
-    element.Height(0);
-    element.MaxHeight(0);
-    element.Margin({});
-    element.HorizontalAlignment(wux::HorizontalAlignment::Left);
-    element.VerticalAlignment(wux::VerticalAlignment::Top);
-    element.Opacity(0);
-    element.IsHitTestVisible(false);
+    if (element.Visibility() != wux::Visibility::Collapsed) {
+        element.Visibility(wux::Visibility::Collapsed);
+    }
+    if (element.Width() != 0) {
+        element.Width(0);
+    }
+    if (element.MinWidth() != 0) {
+        element.MinWidth(0);
+    }
+    if (element.MaxWidth() != 0) {
+        element.MaxWidth(0);
+    }
+    if (element.MinHeight() != 0) {
+        element.MinHeight(0);
+    }
+    if (element.Height() != 0) {
+        element.Height(0);
+    }
+    if (element.MaxHeight() != 0) {
+        element.MaxHeight(0);
+    }
+    if (element.Margin() != wux::Thickness{}) {
+        element.Margin({});
+    }
+    if (element.HorizontalAlignment() != wux::HorizontalAlignment::Left) {
+        element.HorizontalAlignment(wux::HorizontalAlignment::Left);
+    }
+    if (element.VerticalAlignment() != wux::VerticalAlignment::Top) {
+        element.VerticalAlignment(wux::VerticalAlignment::Top);
+    }
+    if (element.Opacity() != 0) {
+        element.Opacity(0);
+    }
+    if (element.IsHitTestVisible()) {
+        element.IsHitTestVisible(false);
+    }
 }
 
 void KeepElementCollapsed(wux::FrameworkElement const& element) {
+    for (auto const& collapsedElement : g_keepCollapsedElements) {
+        if (collapsedElement.get() == element) {
+            return;
+        }
+    }
+
+    g_keepCollapsedElements.push_back(winrt::make_weak(element));
+
     element.RegisterPropertyChangedCallback(
         wux::UIElement::VisibilityProperty(),
         [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
@@ -236,7 +349,18 @@ void ApplyHeaderText(wux::FrameworkElement const& element) {
     }
 
     if (auto textBlock = element.try_as<wuc::TextBlock>()) {
-        textBlock.Text(g_settings.headerText);
+        if (textBlock.Text() != g_settings.headerText) {
+            textBlock.Text(g_settings.headerText);
+        }
+
+        for (auto const& headerTextElement : g_headerTextElements) {
+            if (headerTextElement.get() == textBlock) {
+                return;
+            }
+        }
+
+        g_headerTextElements.push_back(winrt::make_weak(textBlock));
+
         textBlock.RegisterPropertyChangedCallback(
             wuc::TextBlock::TextProperty(),
             [](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
@@ -311,35 +435,20 @@ bool IsAllAppsGridView(wux::FrameworkElement const& element, PCWSTR type) {
            winrt::get_class_name(element) == L"StartDocked.AllAppsGridListView";
 }
 
-void FlattenAllAppsGridSource(wux::FrameworkElement const& element,
-                              PCWSTR type) {
-    if (!IsAllAppsGridView(element, type)) {
-        return;
-    }
+std::vector<wf::IInspectable> GetFlatItemsFromGroupedSource(
+    wf::IInspectable const& source) {
+    std::vector<wf::IInspectable> flatItems;
 
-    auto itemsControl = element.try_as<wuc::ItemsControl>();
-    if (!itemsControl) {
-        return;
-    }
-
-    for (auto const& entry : g_flattenedSources) {
-        if (entry.itemsControl.get() == itemsControl) {
-            return;
-        }
-    }
-
-    auto originalSource = itemsControl.ItemsSource();
-    auto collectionView = originalSource.try_as<wuxd::ICollectionView>();
+    auto collectionView = source.try_as<wuxd::ICollectionView>();
     if (!collectionView) {
-        return;
+        return flatItems;
     }
 
     auto groups = collectionView.CollectionGroups();
     if (!groups || groups.Size() == 0) {
-        return;
+        return flatItems;
     }
 
-    std::vector<wf::IInspectable> flatItems;
     for (uint32_t groupIndex = 0; groupIndex < groups.Size(); groupIndex++) {
         auto group = groups.GetAt(groupIndex).try_as<wuxd::ICollectionViewGroup>();
         if (!group) {
@@ -357,13 +466,97 @@ void FlattenAllAppsGridSource(wux::FrameworkElement const& element,
         }
     }
 
+    return flatItems;
+}
+
+bool FlatSourceMatchesItems(
+    wfc::IObservableVector<wf::IInspectable> const& flatSource,
+    std::vector<wf::IInspectable> const& flatItems) {
+    if (!flatSource || flatSource.Size() != flatItems.size()) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < flatItems.size(); i++) {
+        if (flatSource.GetAt(i) != flatItems[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void ReplaceFlatSourceItems(
+    wfc::IObservableVector<wf::IInspectable> const& flatSource,
+    std::vector<wf::IInspectable> const& flatItems) {
+    flatSource.Clear();
+    for (auto const& item : flatItems) {
+        flatSource.Append(item);
+    }
+}
+
+void RefreshFlattenedSource(FlattenedSourceEntry& entry) {
+    auto itemsControl = entry.itemsControl.get();
+    if (!itemsControl || !entry.originalSource) {
+        return;
+    }
+
+    auto currentSource = itemsControl.ItemsSource();
+    if (entry.flatSource && currentSource != entry.flatSource) {
+        entry.originalSource = currentSource;
+    }
+
+    auto flatItems = GetFlatItemsFromGroupedSource(entry.originalSource);
+    if (flatItems.empty()) {
+        return;
+    }
+
+    if (!entry.flatSource) {
+        entry.flatSource =
+            winrt::single_threaded_observable_vector<wf::IInspectable>();
+    }
+
+    if (!FlatSourceMatchesItems(entry.flatSource, flatItems)) {
+        ReplaceFlatSourceItems(entry.flatSource, flatItems);
+    }
+
+    if (itemsControl.ItemsSource() != entry.flatSource) {
+        itemsControl.ItemsSource(entry.flatSource);
+    }
+
+    if (itemsControl.GroupStyle().Size() > 0) {
+        itemsControl.GroupStyle().Clear();
+    }
+}
+
+void FlattenAllAppsGridSource(wux::FrameworkElement const& element,
+                              PCWSTR type) {
+    if (!IsAllAppsGridView(element, type)) {
+        return;
+    }
+
+    auto itemsControl = element.try_as<wuc::ItemsControl>();
+    if (!itemsControl) {
+        return;
+    }
+
+    for (auto& entry : g_flattenedSources) {
+        if (entry.itemsControl.get() == itemsControl) {
+            RefreshFlattenedSource(entry);
+            return;
+        }
+    }
+
+    auto originalSource = itemsControl.ItemsSource();
+    auto flatItems = GetFlatItemsFromGroupedSource(originalSource);
     if (flatItems.empty()) {
         return;
     }
 
     auto flatSource = winrt::single_threaded_observable_vector(std::move(flatItems));
     itemsControl.ItemsSource(flatSource);
-    itemsControl.GroupStyle().Clear();
+    if (itemsControl.GroupStyle().Size() > 0) {
+        itemsControl.GroupStyle().Clear();
+    }
 
     g_flattenedSources.push_back(
         {winrt::make_weak(itemsControl), originalSource, flatSource});
@@ -428,8 +621,165 @@ void DisableCategorySemanticZoom(wuc::SemanticZoom const& semanticZoom) {
         });
 }
 
-void HideStartMenuElement(InstanceHandle handle,
-                          wux::FrameworkElement const& element,
+void SetScrollViewerVerticalScrollBarVisibility(
+    wuc::ScrollViewer const& scrollViewer,
+    wuc::ScrollBarVisibility visibility) {
+    if (scrollViewer.VerticalScrollBarVisibility() != visibility) {
+        scrollViewer.VerticalScrollBarVisibility(visibility);
+    }
+}
+
+void SetScrollBarOpacity(wucp::ScrollBar const& scrollBar, double opacity) {
+    if (scrollBar.Opacity() != opacity) {
+        scrollBar.Opacity(opacity);
+    }
+
+    bool visible = opacity > 0;
+    if (scrollBar.IsHitTestVisible() != visible) {
+        scrollBar.IsHitTestVisible(visible);
+    }
+}
+
+void StopScrollBarFadeTimer() {
+    if (g_scrollBarFadeTimer) {
+        g_scrollBarFadeTimer.Stop();
+    }
+}
+
+void FadeAutoScrollBars() {
+    if (g_settings.scrollBarMode != ScrollBarMode::ShowWhileScrolling) {
+        return;
+    }
+
+    bool stillFading = false;
+    for (auto const& weakScrollBar : g_scrollBarModeScrollBars) {
+        if (auto scrollBar = weakScrollBar.get()) {
+            double opacity = scrollBar.Opacity();
+            double nextOpacity = opacity > 0.2 ? opacity - 0.2 : 0;
+            SetScrollBarOpacity(scrollBar, nextOpacity);
+            if (nextOpacity > 0) {
+                stillFading = true;
+            }
+        }
+    }
+
+    if (!stillFading) {
+        StopScrollBarFadeTimer();
+    }
+}
+
+void StartScrollBarFadeTimer() {
+    if (!g_scrollBarFadeTimer) {
+        g_scrollBarFadeTimer = wux::DispatcherTimer();
+        g_scrollBarFadeTimer.Interval(std::chrono::milliseconds(50));
+        g_scrollBarFadeTimer.Tick(
+            [](wf::IInspectable const&, wf::IInspectable const&) {
+                FadeAutoScrollBars();
+            });
+    }
+
+    g_scrollBarFadeTimer.Stop();
+    g_scrollBarFadeTimer.Start();
+}
+
+void RestartScrollBarHideTimer() {
+    if (!g_scrollBarHideTimer) {
+        g_scrollBarHideTimer = wux::DispatcherTimer();
+        g_scrollBarHideTimer.Interval(std::chrono::milliseconds(200));
+        g_scrollBarHideTimer.Tick(
+            [](wf::IInspectable const&, wf::IInspectable const&) {
+                if (g_scrollBarHideTimer) {
+                    g_scrollBarHideTimer.Stop();
+                }
+                StartScrollBarFadeTimer();
+            });
+    }
+
+    g_scrollBarHideTimer.Stop();
+    g_scrollBarHideTimer.Start();
+}
+
+void ShowAutoScrollBarsWhileScrolling(wuc::ScrollViewer const& scrollViewer) {
+    if (g_settings.scrollBarMode != ScrollBarMode::ShowWhileScrolling) {
+        return;
+    }
+
+    StopScrollBarFadeTimer();
+    SetScrollViewerVerticalScrollBarVisibility(
+        scrollViewer, wuc::ScrollBarVisibility::Visible);
+
+    for (auto const& weakScrollBar : g_scrollBarModeScrollBars) {
+        if (auto scrollBar = weakScrollBar.get()) {
+            SetScrollBarOpacity(scrollBar, 1);
+        }
+    }
+
+    RestartScrollBarHideTimer();
+}
+
+void ApplyScrollBarElementMode(wucp::ScrollBar const& scrollBar) {
+    if (!IsInAllAppsArea(scrollBar)) {
+        return;
+    }
+
+    if (g_settings.scrollBarMode == ScrollBarMode::Show) {
+        SetScrollBarOpacity(scrollBar, 1);
+        return;
+    }
+
+    if (g_settings.scrollBarMode == ScrollBarMode::Hide) {
+        SetScrollBarOpacity(scrollBar, 0);
+        return;
+    }
+
+    for (auto const& weakScrollBar : g_scrollBarModeScrollBars) {
+        if (weakScrollBar.get() == scrollBar) {
+            return;
+        }
+    }
+
+    g_scrollBarModeScrollBars.push_back(winrt::make_weak(scrollBar));
+    SetScrollBarOpacity(scrollBar, 0);
+}
+
+void ApplyScrollBarMode(wuc::ScrollViewer const& scrollViewer) {
+    if (!IsInAllAppsArea(scrollViewer)) {
+        return;
+    }
+
+    if (g_settings.scrollBarMode == ScrollBarMode::Show) {
+        SetScrollViewerVerticalScrollBarVisibility(
+            scrollViewer, wuc::ScrollBarVisibility::Auto);
+        return;
+    }
+
+    if (g_settings.scrollBarMode == ScrollBarMode::Hide) {
+        SetScrollViewerVerticalScrollBarVisibility(
+            scrollViewer, wuc::ScrollBarVisibility::Hidden);
+        return;
+    }
+
+    for (auto const& weakScrollViewer : g_scrollBarModeScrollViewers) {
+        if (weakScrollViewer.get() == scrollViewer) {
+            return;
+        }
+    }
+
+    g_scrollBarModeScrollViewers.push_back(winrt::make_weak(scrollViewer));
+
+    SetScrollViewerVerticalScrollBarVisibility(
+        scrollViewer, wuc::ScrollBarVisibility::Visible);
+
+    scrollViewer.ViewChanged(
+        [](wf::IInspectable const& sender,
+           wuc::ScrollViewerViewChangedEventArgs const&) {
+            if (auto scrollViewer = sender.try_as<wuc::ScrollViewer>()) {
+                ShowAutoScrollBarsWhileScrolling(scrollViewer);
+            }
+        });
+}
+
+void HideStartMenuElement(wux::FrameworkElement const& element,
                           PCWSTR type) {
     ApplyHeaderText(element);
 
@@ -447,17 +797,25 @@ void HideStartMenuElement(InstanceHandle handle,
         }
     }
 
-    if (g_settings.hideScrollBar && element.try_as<wucp::ScrollBar>() &&
-        IsInAllAppsArea(element)) {
-        CollapseElement(element);
-        KeepElementCollapsed(element);
-        return;
+    if (auto scrollViewer = element.try_as<wuc::ScrollViewer>()) {
+        ApplyScrollBarMode(scrollViewer);
+    }
+
+    if (auto scrollBar = element.try_as<wucp::ScrollBar>()) {
+        ApplyScrollBarElementMode(scrollBar);
     }
 
     if (IsGroupHeaderElement(element, type) ||
-        IsPinnedSectionElement(element, type) ||
-        element.Name() == L"TopLevelSuggestionsRoot" ||
-        (g_settings.hideTopLevelHeader && element.Name() == L"TopLevelHeader")) {
+        (g_settings.hidePinnedSection &&
+         IsPinnedSectionElement(element, type)) ||
+        ((g_settings.hidePinnedSection || g_settings.hidePinnedHeader) &&
+         IsPinnedHeaderElement(element)) ||
+        (g_settings.hideRecommendedSection &&
+         element.Name() == L"TopLevelSuggestionsRoot") ||
+        ((g_settings.hideRecommendedSection ||
+          g_settings.hideRecommendedHeader) &&
+         IsRecommendedHeaderElement(element)) ||
+        (g_settings.hideTopLevelHeader && IsAllAppsTopHeaderElement(element))) {
         CollapseElement(element);
         KeepElementCollapsed(element);
     }
@@ -470,185 +828,116 @@ void HideStartMenuElement(InstanceHandle handle,
     }
 }
 
-class VisualTreeWatcher : public winrt::implements<VisualTreeWatcher, IVisualTreeServiceCallback2, winrt::non_agile> {
-public:
-    VisualTreeWatcher(winrt::com_ptr<IUnknown> site) {
-        m_XamlDiagnostics = site.as<IXamlDiagnostics>();
-        HANDLE thread = CreateThread(
-            nullptr, 0,
-            [](LPVOID lpParam) -> DWORD {
-                auto watcher = reinterpret_cast<VisualTreeWatcher*>(lpParam);
-                HRESULT hr = watcher->m_XamlDiagnostics.as<IVisualTreeService3>()->AdviseVisualTreeChange(watcher);
-                watcher->Release();
-                if (FAILED(hr)) {
-                    Wh_Log(L"AdviseVisualTreeChange failed: %08X", hr);
-                }
-                return 0;
-            },
-            this, 0, nullptr);
-        if (thread) {
-            AddRef();
-            CloseHandle(thread);
-        }
-    }
-
-    void UnadviseVisualTreeChange() {
-        HRESULT hr = m_XamlDiagnostics.as<IVisualTreeService3>()->UnadviseVisualTreeChange(this);
-        if (FAILED(hr)) {
-            Wh_Log(L"UnadviseVisualTreeChange failed: %08X", hr);
-        }
-    }
-
-private:
-    wf::IInspectable FromHandle(InstanceHandle handle) {
-        wf::IInspectable obj;
-        winrt::check_hresult(m_XamlDiagnostics->GetIInspectableFromHandle(
-            handle, reinterpret_cast<::IInspectable**>(winrt::put_abi(obj))));
-        return obj;
-    }
-
-    HRESULT STDMETHODCALLTYPE OnVisualTreeChange(ParentChildRelation, VisualElement element, VisualMutationType mutationType) override try {
-        if (g_targetThreadId && GetCurrentThreadId() != g_targetThreadId) {
-            return S_OK;
-        }
-
-        if (mutationType == Add) {
-            if (auto frameworkElement = FromHandle(element.Handle).try_as<wux::FrameworkElement>()) {
-                HideStartMenuElement(element.Handle, frameworkElement, element.Type);
-            }
-        }
-
-        return S_OK;
-    } catch (...) {
-        Wh_Log(L"OnVisualTreeChange error: %08X", winrt::to_hresult());
-        return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE OnElementStateChanged(InstanceHandle, VisualElementState, LPCWSTR) noexcept override {
-        return S_OK;
-    }
-
-    winrt::com_ptr<IXamlDiagnostics> m_XamlDiagnostics = nullptr;
-};
-
-winrt::com_ptr<VisualTreeWatcher> g_visualTreeWatcher;
-
-// {C85D8CC7-5463-40E8-A432-F5916B6427E5}
-static constexpr CLSID CLSID_WindhawkTAP = {
-    0xc85d8cc7, 0x5463, 0x40e8, {0xa4, 0x32, 0xf5, 0x91, 0x6b, 0x64, 0x27, 0xe5}};
-
-class WindhawkTAP : public winrt::implements<WindhawkTAP, IObjectWithSite, winrt::non_agile> {
-public:
-    HRESULT STDMETHODCALLTYPE SetSite(IUnknown* pUnkSite) override try {
-        if (g_visualTreeWatcher) {
-            g_visualTreeWatcher->UnadviseVisualTreeChange();
-            g_visualTreeWatcher = nullptr;
-        }
-
-        m_site.copy_from(pUnkSite);
-        if (m_site) {
-            FreeLibrary(GetCurrentModuleHandle());
-            g_visualTreeWatcher = winrt::make_self<VisualTreeWatcher>(m_site);
-        }
-
-        return S_OK;
-    } catch (...) {
-        return winrt::to_hresult();
-    }
-
-    HRESULT STDMETHODCALLTYPE GetSite(REFIID riid, void** ppvSite) noexcept override {
-        return m_site.as(riid, ppvSite);
-    }
-
-private:
-    winrt::com_ptr<IUnknown> m_site;
-};
-
-template <class T>
-struct SimpleFactory : winrt::implements<SimpleFactory<T>, IClassFactory, winrt::non_agile> {
-    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppvObject) override try {
-        if (pUnkOuter) {
-            return CLASS_E_NOAGGREGATION;
-        }
-
-        *ppvObject = nullptr;
-        return winrt::make<T>().as(riid, ppvObject);
-    } catch (...) {
-        return winrt::to_hresult();
-    }
-
-    HRESULT STDMETHODCALLTYPE LockServer(BOOL) noexcept override {
-        return S_OK;
-    }
-};
-
-__declspec(dllexport) STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) try {
-    if (rclsid == CLSID_WindhawkTAP) {
-        *ppv = nullptr;
-        return winrt::make<SimpleFactory<WindhawkTAP>>().as(riid, ppv);
-    }
-
-    return CLASS_E_CLASSNOTAVAILABLE;
-} catch (...) {
-    return winrt::to_hresult();
-}
-
-__declspec(dllexport) STDAPI DllCanUnloadNow() {
-    return winrt::get_module_lock() ? S_FALSE : S_OK;
-}
-
-using PFN_INITIALIZE_XAML_DIAGNOSTICS_EX = decltype(&InitializeXamlDiagnosticsEx);
-
-HRESULT InjectWindhawkTAP() noexcept {
-    HMODULE module = GetCurrentModuleHandle();
-    if (!module) {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-
-    WCHAR location[MAX_PATH];
-    switch (GetModuleFileName(module, location, ARRAYSIZE(location))) {
-        case 0:
-        case ARRAYSIZE(location):
-            return HRESULT_FROM_WIN32(GetLastError());
-    }
-
-    HMODULE wuxModule = LoadLibraryEx(L"Windows.UI.Xaml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!wuxModule) {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-
-    auto initializeXamlDiagnosticsEx =
-        reinterpret_cast<PFN_INITIALIZE_XAML_DIAGNOSTICS_EX>(
-            GetProcAddress(wuxModule, "InitializeXamlDiagnosticsEx"));
-    if (!initializeXamlDiagnosticsEx) {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-
-    HRESULT hr = E_FAIL;
-    for (int i = 0; i < 10000; i++) {
-        WCHAR connectionName[256];
-        wsprintf(connectionName, L"VisualDiagConnection%d", i + 1);
-
-        hr = initializeXamlDiagnosticsEx(connectionName, GetCurrentProcessId(), L"", location, CLSID_WindhawkTAP, nullptr);
-        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
-            break;
-        }
-    }
-
-    return hr;
-}
-
-void InitializeXamlWatcher() {
-    DWORD noThreadId = 0;
-    if (!g_targetThreadId.compare_exchange_strong(noThreadId, GetCurrentThreadId())) {
+void ProcessXamlElement(wux::FrameworkElement const& element) {
+    if (!element || g_processingXamlElement) {
         return;
     }
 
-    HRESULT hr = InjectWindhawkTAP();
-    if (FAILED(hr)) {
-        Wh_Log(L"InjectWindhawkTAP failed: %08X", hr);
-        g_targetThreadId = 0;
+    g_processingXamlElement = true;
+
+    try {
+        HideStartMenuElement(element, nullptr);
+    } catch (...) {
+        Wh_Log(L"ProcessXamlElement error: %08X", winrt::to_hresult());
     }
+
+    g_processingXamlElement = false;
+}
+
+void ProcessXamlSubtree(wux::DependencyObject const& root) {
+    if (!root) {
+        return;
+    }
+
+    std::vector<wux::DependencyObject> stack;
+    stack.push_back(root);
+
+    while (!stack.empty()) {
+        auto current = stack.back();
+        stack.pop_back();
+
+        if (auto element = current.try_as<wux::FrameworkElement>()) {
+            ProcessXamlElement(element);
+        }
+
+        int childCount = wux::Media::VisualTreeHelper::GetChildrenCount(current);
+        for (int i = childCount - 1; i >= 0; i--) {
+            auto child = wux::Media::VisualTreeHelper::GetChild(current, i);
+            if (child) {
+                stack.push_back(child);
+            }
+        }
+    }
+}
+
+void ProcessCurrentXamlTree() {
+    try {
+        auto window = wux::Window::Current();
+        if (!window) {
+            return;
+        }
+
+        auto root = window.Content().try_as<wux::DependencyObject>();
+        ProcessXamlSubtree(root);
+
+        auto popups = wux::Media::VisualTreeHelper::GetOpenPopups(window);
+        for (uint32_t i = 0; i < popups.Size(); i++) {
+            auto popup = popups.GetAt(i);
+            if (!popup.IsOpen()) {
+                continue;
+            }
+
+            if (auto popupChild = popup.Child().try_as<wux::DependencyObject>()) {
+                ProcessXamlSubtree(popupChild);
+            }
+        }
+    } catch (...) {
+        Wh_Log(L"ProcessCurrentXamlTree error: %08X", winrt::to_hresult());
+    }
+}
+
+void InstallXamlTraversal() {
+    bool expected = false;
+    if (!g_xamlTraversalInstalled.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    try {
+        ProcessCurrentXamlTree();
+
+        g_xamlTraversalTimer = wux::DispatcherTimer();
+        g_xamlTraversalTimer.Interval(std::chrono::milliseconds(250));
+        g_xamlTraversalTimer.Tick(
+            [](wf::IInspectable const&, wf::IInspectable const&) {
+                ProcessCurrentXamlTree();
+            });
+        g_xamlTraversalTimer.Start();
+    } catch (...) {
+        g_xamlTraversalInstalled = false;
+        g_xamlTraversalTimer = nullptr;
+        Wh_Log(L"InstallXamlTraversal error: %08X", winrt::to_hresult());
+    }
+}
+
+void UninstallXamlTraversal() {
+    try {
+        if (g_xamlTraversalTimer) {
+            g_xamlTraversalTimer.Stop();
+            g_xamlTraversalTimer = nullptr;
+        }
+        if (g_scrollBarHideTimer) {
+            g_scrollBarHideTimer.Stop();
+            g_scrollBarHideTimer = nullptr;
+        }
+        if (g_scrollBarFadeTimer) {
+            g_scrollBarFadeTimer.Stop();
+            g_scrollBarFadeTimer = nullptr;
+        }
+    } catch (...) {
+        Wh_Log(L"UninstallXamlTraversal error: %08X", winrt::to_hresult());
+    }
+
+    g_xamlTraversalInstalled = false;
 }
 
 using RunFromWindowThreadProc_t = void(WINAPI*)(PVOID parameter);
@@ -731,7 +1020,7 @@ void OnWindowCreated(HWND hWnd, LPCWSTR lpClassName) {
         return;
     }
 
-    RunFromWindowThread(hWnd, [](PVOID) { InitializeXamlWatcher(); }, nullptr);
+    RunFromWindowThread(hWnd, [](PVOID) { InstallXamlTraversal(); }, nullptr);
 }
 
 using CreateWindowInBand_t = HWND(WINAPI*)(DWORD dwExStyle,
@@ -838,22 +1127,29 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     HWND coreWnd = GetCoreWnd();
     if (coreWnd) {
-        RunFromWindowThread(coreWnd, [](PVOID) { InitializeXamlWatcher(); }, nullptr);
+        RunFromWindowThread(coreWnd, [](PVOID) { InstallXamlTraversal(); }, nullptr);
     } else {
-        InitializeXamlWatcher();
+        InstallXamlTraversal();
     }
 }
 
 void Wh_ModUninit() {
-    if (g_visualTreeWatcher) {
-        g_visualTreeWatcher->UnadviseVisualTreeChange();
-        g_visualTreeWatcher = nullptr;
+    HWND coreWnd = GetCoreWnd();
+    if (coreWnd) {
+        RunFromWindowThread(coreWnd, [](PVOID) { UninstallXamlTraversal(); },
+                            nullptr);
+    } else {
+        UninstallXamlTraversal();
     }
 
     g_flattenedSources.clear();
     g_hookedSemanticZooms.clear();
     g_gapAdjustedItemsWrapGrids.clear();
-    g_targetThreadId = 0;
+    g_keepCollapsedElements.clear();
+    g_headerTextElements.clear();
+    g_scrollBarModeScrollViewers.clear();
+    g_scrollBarModeScrollBars.clear();
+    g_xamlTraversalInstalled = false;
 }
 
 void Wh_ModSettingsChanged() {
