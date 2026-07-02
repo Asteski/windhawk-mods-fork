@@ -21,7 +21,7 @@
 - headerText: "Installed apps"
   $name: Change Header Text
   $description: Text to show in the All apps header.
-- hiddenHeaderIconGap: 16
+- hiddenHeaderIconGap: 0
   $name: Hidden header icon gap
   $description: Top gap, in pixels, between search and the first icon row when the top header is hidden.
 - scrollBarMode: "showWhileScrolling"
@@ -32,6 +32,9 @@
   - hide: Hide
   - showWhileScrolling: Show while scrolling
 - SectionsAndHeaders:
+    - showSectionSeparators: false
+      $name: Show section separators
+      $description: Add thin separator lines between Start menu sections.
     - hidePinnedSection: true
       $name: Hide pinned section
       $description: Hide the Start menu pinned apps section.
@@ -53,10 +56,15 @@
 # Compact Start Menu
 This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 
+| All apps with hidden header (default) | Pinned section without header + Separator + All section in List view |
+| :---: | :---: |
+| ![Default](https://raw.githubusercontent.com/Asteski/Windhawk-Mods/refs/heads/main/img/compact-start-menu/1.png) | ![Pinned section and separator](https://raw.githubusercontent.com/Asteski/Windhawk-Mods/refs/heads/main/img/compact-start-menu/2.png) |
+
 ### Features:
 * **Shows "All apps":** Keeps the app list visible.
 * **Optional pinned section hiding:** Can hide or show the section with pinned apps.
 * **Optional recommended section hiding:** Can hide or show the section with recent files.
+* **Optional section separators:** Can add thin separator lines between sections.
 * **Optional section headers:** Can hide pinned and recommended headers independently.
 * **Hides group headers:** Removes the visible All apps group headers in grid and list views.
 * **Compacts grid view:** Reduces group-header spacing in the All apps grid.
@@ -81,18 +89,23 @@ This mod simplifies the Start Menu by directly adjusting All apps XAML sections.
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.UI.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Data.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/base.h>
 
 namespace wf = winrt::Windows::Foundation;
 namespace wfc = winrt::Windows::Foundation::Collections;
+namespace wu = winrt::Windows::UI;
 namespace wux = winrt::Windows::UI::Xaml;
 namespace wuc = winrt::Windows::UI::Xaml::Controls;
 namespace wucp = winrt::Windows::UI::Xaml::Controls::Primitives;
+namespace wuxm = winrt::Windows::UI::Xaml::Media;
+namespace wuxs = winrt::Windows::UI::Xaml::Shapes;
 namespace wuxd = winrt::Windows::UI::Xaml::Data;
 
 enum class ScrollBarMode {
@@ -102,6 +115,7 @@ enum class ScrollBarMode {
 };
 
 struct Settings {
+    bool showSectionSeparators = false;
     bool hidePinnedSection = true;
     bool hidePinnedHeader = true;
     bool hideRecommendedSection = true;
@@ -186,6 +200,12 @@ struct ScrollBarEntry {
     bool originalIsHitTestVisible;
 };
 
+struct SectionSeparatorEntry {
+    winrt::weak_ref<wuc::Panel> parent;
+    winrt::weak_ref<wux::UIElement> separator;
+    int kind;
+};
+
 std::vector<FlattenedSourceEntry> g_flattenedSources;
 std::vector<SemanticZoomEntry> g_hookedSemanticZooms;
 std::vector<ItemsWrapGridEntry> g_gapAdjustedItemsWrapGrids;
@@ -193,11 +213,17 @@ std::vector<CollapsedElementEntry> g_keepCollapsedElements;
 std::vector<HeaderTextEntry> g_headerTextElements;
 std::vector<ScrollViewerEntry> g_scrollBarModeScrollViewers;
 std::vector<ScrollBarEntry> g_scrollBarModeScrollBars;
+std::vector<SectionSeparatorEntry> g_sectionSeparators;
 wux::DispatcherTimer g_xamlTraversalTimer{nullptr};
 wux::DispatcherTimer g_scrollBarHideTimer{nullptr};
 wux::DispatcherTimer g_scrollBarFadeTimer{nullptr};
 
+const wchar_t kSectionSeparatorName[] = L"CompactStartMenuSectionSeparator";
+
 void LoadSettings() {
+    g_settings.showSectionSeparators =
+        Wh_GetIntSetting(L"SectionsAndHeaders.showSectionSeparators") != 0;
+
     g_settings.hidePinnedSection =
         Wh_GetIntSetting(L"SectionsAndHeaders.hidePinnedSection") != 0;
     g_settings.hidePinnedHeader =
@@ -551,6 +577,95 @@ bool IsAllAppsGridView(wux::FrameworkElement const& element) {
     return element.Name() == L"AllAppsGrid" ||
            element.Name() == L"AppsList" ||
            winrt::get_class_name(element) == L"StartDocked.AllAppsGridListView";
+}
+
+bool IsPinnedSectionSeparatorTarget(wux::FrameworkElement const& element) {
+    auto name = element.Name();
+    auto className = winrt::get_class_name(element);
+
+    return name == L"StartMenuPinnedList" ||
+           name == L"PinnedList" ||
+           className == L"StartMenu.PinnedList";
+}
+
+bool IsRecommendedSectionSeparatorTarget(wux::FrameworkElement const& element) {
+    return element.Name() == L"TopLevelSuggestionsRoot";
+}
+
+enum SectionSeparatorKind {
+    SectionSeparatorKindNone = 0,
+    SectionSeparatorKindPinned = 1,
+    SectionSeparatorKindRecommended = 2,
+};
+
+int GetSectionSeparatorKind(wux::FrameworkElement const& element) {
+    if (!g_settings.showSectionSeparators) {
+        return SectionSeparatorKindNone;
+    }
+
+    bool pinnedVisible = !g_settings.hidePinnedSection;
+    bool recommendedVisible = !g_settings.hideRecommendedSection;
+
+    if (pinnedVisible && IsPinnedSectionSeparatorTarget(element)) {
+        return SectionSeparatorKindPinned;
+    }
+
+    if (recommendedVisible && IsRecommendedSectionSeparatorTarget(element)) {
+        return SectionSeparatorKindRecommended;
+    }
+
+    return SectionSeparatorKindNone;
+}
+
+void ApplySectionSeparator(wux::FrameworkElement const& target) {
+    int separatorKind = GetSectionSeparatorKind(target);
+    if (separatorKind == SectionSeparatorKindNone) {
+        return;
+    }
+
+    for (auto const& entry : g_sectionSeparators) {
+        if (entry.kind == separatorKind) {
+            return;
+        }
+    }
+
+    auto parent = wux::Media::VisualTreeHelper::GetParent(target).try_as<wuc::Panel>();
+    if (!parent) {
+        return;
+    }
+
+    auto children = parent.Children();
+    uint32_t targetIndex = 0;
+    if (!children.IndexOf(target.as<wux::UIElement>(), targetIndex)) {
+        return;
+    }
+
+    wuxs::Rectangle separator;
+    separator.Name(kSectionSeparatorName);
+    separator.Height(1);
+    separator.MinHeight(1);
+    separator.HorizontalAlignment(wux::HorizontalAlignment::Stretch);
+    separator.VerticalAlignment(wux::VerticalAlignment::Bottom);
+    separator.Margin({40, 0, 40, 0});
+    separator.Opacity(0.55);
+    separator.IsHitTestVisible(false);
+    separator.Fill(wuxm::SolidColorBrush(wu::Color{255, 160, 160, 160}));
+
+    if (auto grid = parent.try_as<wuc::Grid>()) {
+        wuc::Grid::SetRow(separator, wuc::Grid::GetRow(target));
+        wuc::Grid::SetRowSpan(separator, wuc::Grid::GetRowSpan(target));
+        wuc::Grid::SetColumn(separator, wuc::Grid::GetColumn(target));
+        wuc::Grid::SetColumnSpan(separator, wuc::Grid::GetColumnSpan(target));
+        children.Append(separator);
+    } else {
+        children.InsertAt(targetIndex + 1, separator);
+    }
+
+    g_sectionSeparators.push_back({
+        winrt::make_weak(parent),
+        winrt::make_weak(separator.as<wux::UIElement>()),
+        separatorKind,
+    });
 }
 
 std::vector<wf::IInspectable> GetFlatItemsFromGroupedSource(
@@ -955,6 +1070,7 @@ void HideStartMenuElement(wux::FrameworkElement const& element) {
     ApplyHeaderText(element);
 
     FlattenAllAppsGridSource(element);
+    ApplySectionSeparator(element);
 
     if (auto semanticZoom = element.try_as<wuc::SemanticZoom>()) {
         DisableCategorySemanticZoom(semanticZoom);
@@ -1065,6 +1181,8 @@ void ProcessCurrentXamlTree() {
     }
 }
 
+void RemoveSectionSeparatorsFromCurrentXamlTree();
+
 void InstallXamlTraversal() {
     bool expected = false;
     if (!g_xamlTraversalInstalled.compare_exchange_strong(expected, true)) {
@@ -1072,6 +1190,7 @@ void InstallXamlTraversal() {
     }
 
     try {
+        RemoveSectionSeparatorsFromCurrentXamlTree();
         ProcessCurrentXamlTree();
 
         g_xamlTraversalTimer = wux::DispatcherTimer();
@@ -1250,6 +1369,115 @@ void RestoreScrollBarModes() {
     }
 }
 
+bool IsSectionSeparatorElement(wux::UIElement const& element) {
+    if (auto frameworkElement = element.try_as<wux::FrameworkElement>()) {
+        if (frameworkElement.Name() == kSectionSeparatorName) {
+            return true;
+        }
+    }
+
+    auto rectangle = element.try_as<wuxs::Rectangle>();
+    if (!rectangle) {
+        return false;
+    }
+
+    auto margin = rectangle.Margin();
+    return rectangle.Height() == 1 &&
+           rectangle.MinHeight() == 1 &&
+           !rectangle.IsHitTestVisible() &&
+           rectangle.Opacity() == 0.55 &&
+           margin.Left == 40 &&
+           margin.Right == 40;
+}
+
+void RemoveSectionSeparatorsFromSubtree(wux::DependencyObject const& root) {
+    if (!root) {
+        return;
+    }
+
+    std::vector<wux::DependencyObject> stack;
+    stack.push_back(root);
+
+    while (!stack.empty()) {
+        auto current = stack.back();
+        stack.pop_back();
+
+        if (auto panel = current.try_as<wuc::Panel>()) {
+            auto children = panel.Children();
+            for (int i = static_cast<int>(children.Size()) - 1; i >= 0; i--) {
+                auto child = children.GetAt(i);
+                if (IsSectionSeparatorElement(child)) {
+                    children.RemoveAt(i);
+                } else if (auto childObject = child.try_as<wux::DependencyObject>()) {
+                    stack.push_back(childObject);
+                }
+            }
+
+            continue;
+        }
+
+        int childCount = wux::Media::VisualTreeHelper::GetChildrenCount(current);
+        for (int i = childCount - 1; i >= 0; i--) {
+            auto child = wux::Media::VisualTreeHelper::GetChild(current, i);
+            if (child) {
+                stack.push_back(child);
+            }
+        }
+    }
+}
+
+void RemoveSectionSeparatorsFromCurrentXamlTree() {
+    try {
+        auto window = wux::Window::Current();
+        if (!window) {
+            return;
+        }
+
+        auto root = window.Content().try_as<wux::DependencyObject>();
+        RemoveSectionSeparatorsFromSubtree(root);
+
+        auto popups = wux::Media::VisualTreeHelper::GetOpenPopups(window);
+        for (uint32_t i = 0; i < popups.Size(); i++) {
+            auto popup = popups.GetAt(i);
+            if (!popup.IsOpen()) {
+                continue;
+            }
+
+            if (auto popupChild = popup.Child().try_as<wux::DependencyObject>()) {
+                RemoveSectionSeparatorsFromSubtree(popupChild);
+            }
+        }
+    } catch (...) {
+        Wh_Log(L"RemoveSectionSeparatorsFromCurrentXamlTree error: %08X",
+               winrt::to_hresult());
+    }
+}
+
+void RemoveTrackedSectionSeparators() {
+    for (auto& entry : g_sectionSeparators) {
+        try {
+            auto parent = entry.parent.get();
+            auto separator = entry.separator.get();
+            if (!parent || !separator) {
+                continue;
+            }
+
+            auto children = parent.Children();
+            uint32_t index = 0;
+            if (children.IndexOf(separator, index)) {
+                children.RemoveAt(index);
+            }
+        } catch (...) {
+            Wh_Log(L"RemoveSectionSeparators error: %08X", winrt::to_hresult());
+        }
+    }
+}
+
+void RemoveSectionSeparators() {
+    RemoveTrackedSectionSeparators();
+    RemoveSectionSeparatorsFromCurrentXamlTree();
+}
+
 void ClearXamlState() {
     g_flattenedSources.clear();
     g_hookedSemanticZooms.clear();
@@ -1258,11 +1486,13 @@ void ClearXamlState() {
     g_headerTextElements.clear();
     g_scrollBarModeScrollViewers.clear();
     g_scrollBarModeScrollBars.clear();
+    g_sectionSeparators.clear();
 }
 
 void UninstallXamlTraversal() {
     try {
         StopXamlTimers();
+        RemoveSectionSeparators();
         RestoreScrollViewerModes();
         RestoreScrollBarModes();
         RestoreSemanticZooms();
