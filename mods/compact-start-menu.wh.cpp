@@ -19,11 +19,11 @@
   $name: Hide category view option
   $description: Hide the Category option from the All apps view selector.
 - headerText: "Installed apps"
-  $name: Change Header Text
+  $name: Change header text
   $description: Text to show in the All apps header.
 - hiddenHeaderIconGap: 0
   $name: Hidden header icon gap
-  $description: Top gap, in pixels, between search and the first icon row when the top header is hidden.
+  $description: "Top gap, in pixels, between search and the first icon row when the top header is hidden. Recommended values range from 16 to 24."
 - scrollBarMode: "showWhileScrolling"
   $name: Scroll bar
   $description: Controls All apps scroll bar visibility.
@@ -47,7 +47,7 @@
     - hideRecommendedHeader: true
       $name: Hide recommended header
       $description: Hide the Recommended section header.
-  $name: Other Sections
+  $name: Other sections
 */
 // ==/WindhawkModSettings==
 
@@ -127,7 +127,7 @@ struct Settings {
     ScrollBarMode scrollBarMode = ScrollBarMode::ShowWhileScrolling;
 };
 
-Settings g_settings;
+Settings& g_settings = *new Settings();
 
 std::atomic<bool> g_xamlTraversalInstalled = false;
 thread_local bool g_processingXamlElement = false;
@@ -206,17 +206,33 @@ struct SectionSeparatorEntry {
     int kind;
 };
 
-std::vector<FlattenedSourceEntry> g_flattenedSources;
-std::vector<SemanticZoomEntry> g_hookedSemanticZooms;
-std::vector<ItemsWrapGridEntry> g_gapAdjustedItemsWrapGrids;
-std::vector<CollapsedElementEntry> g_keepCollapsedElements;
-std::vector<HeaderTextEntry> g_headerTextElements;
-std::vector<ScrollViewerEntry> g_scrollBarModeScrollViewers;
-std::vector<ScrollBarEntry> g_scrollBarModeScrollBars;
-std::vector<SectionSeparatorEntry> g_sectionSeparators;
-wux::DispatcherTimer g_xamlTraversalTimer{nullptr};
-wux::DispatcherTimer g_scrollBarHideTimer{nullptr};
-wux::DispatcherTimer g_scrollBarFadeTimer{nullptr};
+std::vector<FlattenedSourceEntry>& g_flattenedSources =
+    *new std::vector<FlattenedSourceEntry>();
+std::vector<SemanticZoomEntry>& g_hookedSemanticZooms =
+    *new std::vector<SemanticZoomEntry>();
+std::vector<ItemsWrapGridEntry>& g_gapAdjustedItemsWrapGrids =
+    *new std::vector<ItemsWrapGridEntry>();
+std::vector<CollapsedElementEntry>& g_keepCollapsedElements =
+    *new std::vector<CollapsedElementEntry>();
+std::vector<HeaderTextEntry>& g_headerTextElements =
+    *new std::vector<HeaderTextEntry>();
+std::vector<ScrollViewerEntry>& g_scrollBarModeScrollViewers =
+    *new std::vector<ScrollViewerEntry>();
+std::vector<ScrollBarEntry>& g_scrollBarModeScrollBars =
+    *new std::vector<ScrollBarEntry>();
+std::vector<SectionSeparatorEntry>& g_sectionSeparators =
+    *new std::vector<SectionSeparatorEntry>();
+
+struct TimerState {
+    wux::DispatcherTimer xamlTraversalTimer{nullptr};
+    wux::DispatcherTimer scrollBarHideTimer{nullptr};
+    wux::DispatcherTimer scrollBarFadeTimer{nullptr};
+};
+
+TimerState& g_timers = *new TimerState();
+wux::DispatcherTimer& g_xamlTraversalTimer = g_timers.xamlTraversalTimer;
+wux::DispatcherTimer& g_scrollBarHideTimer = g_timers.scrollBarHideTimer;
+wux::DispatcherTimer& g_scrollBarFadeTimer = g_timers.scrollBarFadeTimer;
 
 const wchar_t kSectionSeparatorName[] = L"CompactStartMenuSectionSeparator";
 
@@ -234,9 +250,10 @@ void LoadSettings() {
         Wh_GetIntSetting(L"SectionsAndHeaders.hideRecommendedHeader") != 0;
     g_settings.hideTopLevelHeader = Wh_GetIntSetting(L"hideTopLevelHeader") != 0;
 
-    PCWSTR headerText = Wh_GetStringSetting(L"headerText");
-    g_settings.headerText = *headerText ? headerText : L"Installed apps";
-    Wh_FreeStringSetting(headerText);
+    auto headerText = WindhawkUtils::StringSetting::make(L"headerText");
+    PCWSTR headerTextValue = headerText.get();
+    g_settings.headerText =
+        *headerTextValue ? headerTextValue : L"Installed apps";
 
     g_settings.hideCategoryViewOption =
         Wh_GetIntSetting(L"hideCategoryViewOption") != 0;
@@ -245,15 +262,15 @@ void LoadSettings() {
         g_settings.hiddenHeaderIconGap = 0;
     }
 
-    PCWSTR scrollBarMode = Wh_GetStringSetting(L"scrollBarMode");
-    if (lstrcmpiW(scrollBarMode, L"hide") == 0) {
+    auto scrollBarMode = WindhawkUtils::StringSetting::make(L"scrollBarMode");
+    PCWSTR scrollBarModeValue = scrollBarMode.get();
+    if (lstrcmpiW(scrollBarModeValue, L"hide") == 0) {
         g_settings.scrollBarMode = ScrollBarMode::Hide;
-    } else if (lstrcmpiW(scrollBarMode, L"showWhileScrolling") == 0) {
+    } else if (lstrcmpiW(scrollBarModeValue, L"showWhileScrolling") == 0) {
         g_settings.scrollBarMode = ScrollBarMode::ShowWhileScrolling;
     } else {
         g_settings.scrollBarMode = ScrollBarMode::Show;
     }
-    Wh_FreeStringSetting(scrollBarMode);
 }
 
 bool IsPinnedSectionElement(wux::FrameworkElement const& element) {
@@ -426,36 +443,84 @@ bool IsCategoryText(winrt::hstring const& text) {
     return lstrcmpiW(text.c_str(), L"Category") == 0;
 }
 
+bool IsLastMenuFlyoutItemInThreeItemFlyout(wuc::MenuFlyoutItem const& item) {
+    auto parent = wux::Media::VisualTreeHelper::GetParent(item)
+                      .try_as<wux::FrameworkElement>();
+    if (!parent) {
+        return false;
+    }
+
+    auto panel = parent.try_as<wuc::Panel>();
+    if (!panel) {
+        return false;
+    }
+
+    auto children = panel.Children();
+    uint32_t menuFlyoutItemCount = 0;
+    uint32_t itemMenuFlyoutIndex = 0;
+    bool foundItem = false;
+
+    for (uint32_t i = 0; i < children.Size(); i++) {
+        auto childMenuFlyoutItem = children.GetAt(i).try_as<wuc::MenuFlyoutItem>();
+        if (!childMenuFlyoutItem) {
+            continue;
+        }
+
+        if (childMenuFlyoutItem == item) {
+            itemMenuFlyoutIndex = menuFlyoutItemCount;
+            foundItem = true;
+        }
+
+        menuFlyoutItemCount++;
+    }
+
+    return foundItem &&
+           menuFlyoutItemCount == 3 &&
+           itemMenuFlyoutIndex == menuFlyoutItemCount - 1;
+}
+
+bool IsCategoryViewOption(wuc::MenuFlyoutItem const& item) {
+    return IsCategoryText(item.Text()) ||
+           IsLastMenuFlyoutItemInThreeItemFlyout(item);
+}
+
 wux::FrameworkElement FindCategoryViewOptionTarget(
     wux::FrameworkElement const& element) {
     if (auto menuFlyoutItem = element.try_as<wuc::MenuFlyoutItem>()) {
-        if (IsCategoryText(menuFlyoutItem.Text())) {
+        if (IsCategoryViewOption(menuFlyoutItem)) {
             return element;
         }
     }
 
     if (auto textBlock = element.try_as<wuc::TextBlock>()) {
-        if (!IsCategoryText(textBlock.Text())) {
-            return nullptr;
-        }
-
         auto current = element;
         while (current) {
-            if (current.try_as<wuc::MenuFlyoutItem>()) {
-                return current;
+            if (auto menuFlyoutItem = current.try_as<wuc::MenuFlyoutItem>()) {
+                if (IsCategoryText(textBlock.Text()) ||
+                    IsCategoryViewOption(menuFlyoutItem)) {
+                    return current;
+                }
+
+                return nullptr;
             }
 
             current = wux::Media::VisualTreeHelper::GetParent(current)
                           .try_as<wux::FrameworkElement>();
         }
 
-        return element;
+        if (IsCategoryText(textBlock.Text())) {
+            return element;
+        }
     }
 
     return nullptr;
 }
 
 void ApplyHeaderText(wux::FrameworkElement const& element) {
+    if (g_settings.hideTopLevelHeader) {
+        return;
+    }
+
     if (element.Name() != L"AllListHeadingText") {
         return;
     }
@@ -1709,11 +1774,22 @@ void Wh_ModUninit() {
     } else {
         UninstallXamlTraversal();
     }
-
-    g_xamlTraversalInstalled = false;
 }
 
 void Wh_ModSettingsChanged() {
-    LoadSettings();
-    ExitProcess(0);
+    HWND coreWnd = GetCoreWnd();
+    if (coreWnd) {
+        RunFromWindowThread(
+            coreWnd,
+            [](PVOID) {
+                UninstallXamlTraversal();
+                LoadSettings();
+                InstallXamlTraversal();
+            },
+            nullptr);
+    } else {
+        UninstallXamlTraversal();
+        LoadSettings();
+        InstallXamlTraversal();
+    }
 }
